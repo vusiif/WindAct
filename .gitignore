@@ -1,0 +1,20 @@
+# Rust build artifacts
+/target/
+
+# Dependencies and internal documentation per specification
+third_party/
+docs/
+
+# Markdown files: ignore all markdown files except README
+*.md
+!README.md
+
+# Agent temporary directory and backups
+.agents/
+*.bak
+
+# OS and editor files
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
