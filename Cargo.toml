@@ -1,0 +1,32 @@
+[package]
+name = "windact"
+version = "0.1.0"
+edition = "2024"
+authors = ["IceLolly <sichen2005@outlook.com>"]
+description = "Physics-based human-like mouse trajectory generator and low-level input injector for Windows"
+readme = "README.md"
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "windact"
+path = "src/lib.rs"
+
+[[bin]]
+name = "windact"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+rand = "0.8"
+thiserror = "2.0"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_HiDpi",
+    "Win32_Media",
+] }
