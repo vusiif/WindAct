@@ -1,8 +1,12 @@
 //! WindAct CLI and execution entry point.
 
 use std::str::FromStr;
+use std::time::Duration;
 use clap::{Parser, Subcommand};
+use rand::Rng;
+
 use windact::core::{ActionResult, MouseButton, Point, WindActError};
+use windact::injector::{default_injector, hybrid_sleep, InputInjector};
 use windact::planner::{TrajectoryPlanner, WindMousePlanner};
 use windact::profile::Profile;
 
@@ -105,26 +109,6 @@ fn parse_point(s: &str) -> Result<Point, WindActError> {
     Ok(Point::new(x, y))
 }
 
-/// Retrieves the current system cursor position if available.
-#[cfg(windows)]
-fn get_current_cursor_pos() -> Option<Point> {
-    use windows_sys::Win32::Foundation::POINT;
-    use windows_sys::Win32::UI::WindowsAndMessaging::GetCursorPos;
-    unsafe {
-        let mut pt = POINT { x: 0, y: 0 };
-        if GetCursorPos(&mut pt) != 0 {
-            Some(Point::new(pt.x as f64, pt.y as f64))
-        } else {
-            None
-        }
-    }
-}
-
-#[cfg(not(windows))]
-fn get_current_cursor_pos() -> Option<Point> {
-    None
-}
-
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
@@ -138,26 +122,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     };
 
+    let injector = default_injector();
     let planner = WindMousePlanner::new();
+    let mut rng = rand::thread_rng();
 
     match command {
         Commands::Click {
             x,
             y,
             start,
-            button: _,
+            button,
             profile,
             dry_run,
         } => {
             let start_point = match start {
                 Some(s) => parse_point(&s)?,
-                None => get_current_cursor_pos().unwrap_or(Point::new(0.0, 0.0)),
+                None => injector.current_cursor_pos().unwrap_or(Point::new(0.0, 0.0)),
             };
             let target_point = Point::new(x, y);
             let profile_cfg = Profile::from_name(&profile);
 
             let trajectory = planner.generate(start_point, target_point, &profile_cfg)?;
             let duration_ms = trajectory.last().map(|p| p.elapsed_ms).unwrap_or(0);
+
+            if !dry_run {
+                injector.play_trajectory(&trajectory)?;
+                let hold_ms = rng.gen_range(profile_cfg.press_hold_min_ms..=profile_cfg.press_hold_max_ms);
+                injector.click_button(button, hold_ms)?;
+            }
 
             let result = ActionResult {
                 id: None,
@@ -169,10 +161,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let json_output = serde_json::to_string_pretty(&result)?;
             println!("{json_output}");
-
-            if !dry_run {
-                eprintln!("\n[Notice] OS SendInput injection will be enabled in Phase 2. Ran dry-run calculation.");
-            }
         }
 
         Commands::Drag {
@@ -188,6 +176,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let trajectory = planner.generate(start_point, target_point, &profile_cfg)?;
             let duration_ms = trajectory.last().map(|p| p.elapsed_ms).unwrap_or(0);
 
+            if !dry_run {
+                // Move cursor to start point
+                injector.move_cursor(start_point.x as i32, start_point.y as i32)?;
+                hybrid_sleep(Duration::from_millis(30));
+
+                // Press left button
+                injector.press_button(MouseButton::Left)?;
+                let pre_drag_hold = rng.gen_range(20..=50);
+                hybrid_sleep(Duration::from_millis(pre_drag_hold));
+
+                // Play trajectory with button held
+                injector.play_trajectory(&trajectory)?;
+
+                // Mandatory dwell / hover at destination before releasing (anti-rebound for sliders)
+                let hover_ms = rng.gen_range(profile_cfg.hover_min_ms..=profile_cfg.hover_max_ms);
+                hybrid_sleep(Duration::from_millis(hover_ms as u64));
+
+                // Release button
+                injector.release_button(MouseButton::Left)?;
+            }
+
             let result = ActionResult {
                 id: None,
                 status: "ok".to_string(),
@@ -198,10 +207,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let json_output = serde_json::to_string_pretty(&result)?;
             println!("{json_output}");
-
-            if !dry_run {
-                eprintln!("\n[Notice] OS SendInput injection will be enabled in Phase 2. Ran dry-run calculation.");
-            }
         }
 
         Commands::Move {
@@ -213,13 +218,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             let start_point = match start {
                 Some(s) => parse_point(&s)?,
-                None => get_current_cursor_pos().unwrap_or(Point::new(0.0, 0.0)),
+                None => injector.current_cursor_pos().unwrap_or(Point::new(0.0, 0.0)),
             };
             let target_point = Point::new(x, y);
             let profile_cfg = Profile::from_name(&profile);
 
             let trajectory = planner.generate(start_point, target_point, &profile_cfg)?;
             let duration_ms = trajectory.last().map(|p| p.elapsed_ms).unwrap_or(0);
+
+            if !dry_run {
+                injector.play_trajectory(&trajectory)?;
+            }
 
             let result = ActionResult {
                 id: None,
@@ -231,10 +240,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let json_output = serde_json::to_string_pretty(&result)?;
             println!("{json_output}");
-
-            if !dry_run {
-                eprintln!("\n[Notice] OS SendInput injection will be enabled in Phase 2. Ran dry-run calculation.");
-            }
         }
     }
 
