@@ -2,6 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::core::{Result, WindActError};
+
 /// Physical and behavioral configuration parameters for mouse trajectory generation.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Profile {
@@ -122,14 +124,60 @@ impl Profile {
         }
     }
 
-    /// Looks up a profile by name (case-insensitive). Defaults to `casual` if unknown.
-    pub fn from_name(name: &str) -> Self {
+    /// Looks up a profile by name (case-insensitive). Returns an error if unknown.
+    pub fn from_name(name: &str) -> Result<Self> {
         match name.to_lowercase().as_str() {
-            "precise" => Self::precise(),
-            "slider" => Self::slider(),
-            "fast" => Self::fast(),
-            _ => Self::casual(),
+            "casual" => Ok(Self::casual()),
+            "precise" => Ok(Self::precise()),
+            "slider" => Ok(Self::slider()),
+            "fast" => Ok(Self::fast()),
+            _ => Err(WindActError::InvalidInput(format!(
+                "Unknown profile '{name}'. Expected one of: casual, precise, slider, fast"
+            ))),
         }
+    }
+
+    /// Validates that physical and timing parameters are within safe, non-degenerate ranges.
+    pub fn validate(&self) -> Result<()> {
+        if self.gravity <= 0.0 || !self.gravity.is_finite() {
+            return Err(WindActError::InvalidInput("gravity must be positive and finite".into()));
+        }
+        if self.wind < 0.0 || !self.wind.is_finite() {
+            return Err(WindActError::InvalidInput("wind must be non-negative and finite".into()));
+        }
+        if self.max_step <= 0.0 || !self.max_step.is_finite() {
+            return Err(WindActError::InvalidInput("max_step must be positive and finite".into()));
+        }
+        if self.target_distance < 0.0 || !self.target_distance.is_finite() {
+            return Err(WindActError::InvalidInput("target_distance must be non-negative".into()));
+        }
+        if self.min_delay_ms > self.max_delay_ms {
+            return Err(WindActError::InvalidInput(format!(
+                "min_delay_ms ({}) cannot exceed max_delay_ms ({})",
+                self.min_delay_ms, self.max_delay_ms
+            )));
+        }
+        if self.press_hold_min_ms > self.press_hold_max_ms {
+            return Err(WindActError::InvalidInput(
+                "press_hold_min_ms cannot exceed press_hold_max_ms".into(),
+            ));
+        }
+        if self.hover_min_ms > self.hover_max_ms {
+            return Err(WindActError::InvalidInput(
+                "hover_min_ms cannot exceed hover_max_ms".into(),
+            ));
+        }
+        if !(0.0..=1.0).contains(&self.overshoot_chance) {
+            return Err(WindActError::InvalidInput(
+                "overshoot_chance must be within [0.0, 1.0]".into(),
+            ));
+        }
+        if self.overshoot_radius < 0.0 || !self.overshoot_radius.is_finite() {
+            return Err(WindActError::InvalidInput(
+                "overshoot_radius must be non-negative".into(),
+            ));
+        }
+        Ok(())
     }
 }
 

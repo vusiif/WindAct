@@ -113,20 +113,18 @@ pub mod windows {
         }
     }
 
-    /// Windows Win32 SendInput based mouse input injector.
-    #[derive(Debug, Default)]
-    pub struct WindowsInjector;
+    /// Cached virtual desktop dimensions for zero-overhead coordinate normalization in hot loops.
+    #[derive(Debug, Clone, Copy)]
+    struct VirtualDesktop {
+        x_virt: i32,
+        y_virt: i32,
+        width_minus_one: i64,
+        height_minus_one: i64,
+    }
 
-    impl WindowsInjector {
-        pub fn new() -> Self {
-            Self
-        }
-
-        /// Maps physical screen coordinates to normalized absolute coordinates (0 ~ 65535)
-        /// with full support for virtual multi-monitor bounding boxes.
-        fn screen_to_normalized(x: i32, y: i32) -> (i32, i32) {
+    impl VirtualDesktop {
+        fn capture() -> Self {
             let _dpi_guard = ThreadDpiGuard::per_monitor();
-
             let x_virt = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) };
             let y_virt = unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) };
             let cx_virt = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) };
@@ -135,13 +133,32 @@ pub mod windows {
             let cx = if cx_virt > 0 { cx_virt } else { unsafe { GetSystemMetrics(SM_CXSCREEN) } };
             let cy = if cy_virt > 0 { cy_virt } else { unsafe { GetSystemMetrics(SM_CYSCREEN) } };
 
-            let cx_i64 = (cx.max(1)) as i64;
-            let cy_i64 = (cy.max(1)) as i64;
+            Self {
+                x_virt,
+                y_virt,
+                width_minus_one: (cx as i64 - 1).max(1),
+                height_minus_one: (cy as i64 - 1).max(1),
+            }
+        }
 
-            let norm_x = (((x - x_virt) as i64 * 65535 + (cx_i64 / 2)) / cx_i64) as i32;
-            let norm_y = (((y - y_virt) as i64 * 65535 + (cy_i64 / 2)) / cy_i64) as i32;
+        /// Maps physical screen coordinates [0, width-1] to Win32 normalized range [0, 65535].
+        #[inline]
+        fn normalize(&self, x: i32, y: i32) -> (i32, i32) {
+            let dx = (x - self.x_virt) as i64;
+            let dy = (y - self.y_virt) as i64;
+            let norm_x = (dx * 65535 + (self.width_minus_one / 2) * dx.signum()) / self.width_minus_one;
+            let norm_y = (dy * 65535 + (self.height_minus_one / 2) * dy.signum()) / self.height_minus_one;
+            (norm_x as i32, norm_y as i32)
+        }
+    }
 
-            (norm_x, norm_y)
+    /// Windows Win32 SendInput based mouse input injector.
+    #[derive(Debug, Default)]
+    pub struct WindowsInjector;
+
+    impl WindowsInjector {
+        pub fn new() -> Self {
+            Self
         }
 
         fn send_mouse_input(flags: u32, dx: i32, dy: i32) -> Result<()> {
@@ -173,7 +190,8 @@ pub mod windows {
 
     impl InputInjector for WindowsInjector {
         fn move_cursor(&self, x: i32, y: i32) -> Result<()> {
-            let (norm_x, norm_y) = Self::screen_to_normalized(x, y);
+            let desktop = VirtualDesktop::capture();
+            let (norm_x, norm_y) = desktop.normalize(x, y);
             let flags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
             Self::send_mouse_input(flags, norm_x, norm_y)
         }
@@ -209,20 +227,24 @@ pub mod windows {
                 return Ok(());
             }
 
-            // Enforce 1ms multimedia timer period during playback
+            // Capture virtual desktop bounds once and enforce 1ms multimedia timer period
+            let desktop = VirtualDesktop::capture();
             let _timer_guard = PrecisionTimerGuard::new(1);
+            let flags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
 
             for point in points {
                 if point.delay_ms > 0 {
                     hybrid_sleep(Duration::from_millis(point.delay_ms as u64));
                 }
-                self.move_cursor(point.x, point.y)?;
+                let (norm_x, norm_y) = desktop.normalize(point.x, point.y);
+                Self::send_mouse_input(flags, norm_x, norm_y)?;
             }
 
             Ok(())
         }
 
         fn current_cursor_pos(&self) -> Result<Point> {
+            let _dpi_guard = ThreadDpiGuard::per_monitor();
             let mut pt = POINT { x: 0, y: 0 };
             if unsafe { GetCursorPos(&mut pt) } != 0 {
                 Ok(Point::new(pt.x as f64, pt.y as f64))

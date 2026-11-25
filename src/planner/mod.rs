@@ -3,9 +3,12 @@
 use std::f64::consts::PI;
 use rand::prelude::*;
 
-use crate::core::{BoundingBox, Point, Result, TrajectoryPoint};
+use crate::core::{BoundingBox, Point, Result, TrajectoryPoint, WindActError};
 use crate::noise::PerlinNoise;
 use crate::profile::Profile;
+
+/// Hard upper bound on simulation iterations per segment to guarantee termination.
+const MAX_SIMULATION_ITERATIONS: usize = 10_000;
 
 /// Trait defining a trajectory planning algorithm.
 pub trait TrajectoryPlanner: Send + Sync {
@@ -36,8 +39,17 @@ impl WindMousePlanner {
     }
 
     /// Samples a target point inside a bounding box using a 2D Gaussian distribution.
-    /// Points cluster near the center with natural spread, avoiding boundary edges.
-    pub fn sample_gaussian_point(bbox: &BoundingBox) -> Point {
+    /// Points cluster near the center with natural spread, safely handling small boxes.
+    pub fn sample_gaussian_point(bbox: &BoundingBox) -> Result<Point> {
+        if bbox.width < 0.0 || bbox.height < 0.0 || !bbox.width.is_finite() || !bbox.height.is_finite() {
+            return Err(WindActError::InvalidInput(
+                "BoundingBox width and height must be non-negative and finite".into(),
+            ));
+        }
+
+        let cx = bbox.x + bbox.width / 2.0;
+        let cy = bbox.y + bbox.height / 2.0;
+
         let mut rng = thread_rng();
         // Box-Muller transform for standard normal distribution
         let u1: f64 = rng.gen_range(1e-7..1.0);
@@ -47,17 +59,23 @@ impl WindMousePlanner {
         let z0 = r * theta.cos();
         let z1 = r * theta.sin();
 
-        // Target center with 3-sigma (99.7%) within padded box boundaries
-        let sigma_x = bbox.width * 0.15;
-        let sigma_y = bbox.height * 0.15;
+        let x = if bbox.width <= 2.0 {
+            cx
+        } else {
+            let pad_x = (bbox.width * 0.1).min(2.0);
+            let sigma_x = bbox.width * 0.15;
+            (cx + z0 * sigma_x).clamp(bbox.x + pad_x, bbox.x + bbox.width - pad_x)
+        };
 
-        let cx = bbox.x + bbox.width / 2.0;
-        let cy = bbox.y + bbox.height / 2.0;
+        let y = if bbox.height <= 2.0 {
+            cy
+        } else {
+            let pad_y = (bbox.height * 0.1).min(2.0);
+            let sigma_y = bbox.height * 0.15;
+            (cy + z1 * sigma_y).clamp(bbox.y + pad_y, bbox.y + bbox.height - pad_y)
+        };
 
-        let x = (cx + z0 * sigma_x).clamp(bbox.x + 2.0, bbox.x + bbox.width - 2.0);
-        let y = (cy + z1 * sigma_y).clamp(bbox.y + 2.0, bbox.y + bbox.height - 2.0);
-
-        Point::new(x, y)
+        Ok(Point::new(x, y))
     }
 
     /// Internal generator for a single segment of WindMouse trajectory.
@@ -83,14 +101,21 @@ impl WindMousePlanner {
         let mut points = Vec::new();
         let mut elapsed_ms = base_elapsed_ms;
 
-        // Main physical simulation loop
-        loop {
+        // Main physical simulation loop with hard iteration cap
+        for _ in 0..MAX_SIMULATION_ITERATIONS {
             let dist = current.distance_to(&destination);
             if dist <= 1.2 {
                 break;
             }
 
             let wind_current = profile.wind.min(dist);
+
+            // Dampen Perlin noise proportionally when approaching target to prevent orbiting
+            let noise_damp = if profile.target_distance > 0.0 && dist < profile.target_distance {
+                (dist / profile.target_distance).clamp(0.0, 1.0)
+            } else {
+                1.0
+            };
 
             if dist >= profile.target_distance {
                 let wx_rand: f64 = rng.gen_range(-1.0..1.0);
@@ -101,7 +126,7 @@ impl WindMousePlanner {
                 wind_x /= sqrt3;
                 wind_y /= sqrt3;
                 if current_max_step < 3.0 {
-                    current_max_step = rng.gen_range(3.0..6.0);
+                    current_max_step = rng.gen_range(2.0_f64..4.0_f64).min(dist.max(1.5));
                 } else {
                     current_max_step /= sqrt5;
                 }
@@ -112,13 +137,13 @@ impl WindMousePlanner {
                 current.x * profile.noise_scale,
                 current.y * profile.noise_scale,
                 0.0,
-            ) * profile.wind * profile.noise_weight;
+            ) * profile.wind * profile.noise_weight * noise_damp;
 
             let noise_y = self.perlin.noise(
                 current.x * profile.noise_scale,
                 current.y * profile.noise_scale,
                 100.0,
-            ) * profile.wind * profile.noise_weight;
+            ) * profile.wind * profile.noise_weight * noise_damp;
 
             // Apply gravity + wind + noise to instantaneous velocity
             velocity_x += wind_x + profile.gravity * (destination.x - current.x) / dist + noise_x;
@@ -167,26 +192,33 @@ impl WindMousePlanner {
         rng: &mut ThreadRng,
     ) -> u32 {
         let normalized_vel = (velocity / profile.max_step).clamp(0.0, 1.0);
+        let min_d = profile.min_delay_ms;
+        let max_d = profile.max_delay_ms.max(min_d);
 
         // Near target: small precision delays
         if distance_to_target < 6.0 {
-            return rng.gen_range(profile.min_delay_ms.max(5)..=profile.max_delay_ms.max(12));
+            let low = min_d.max(5).min(max_d.max(5));
+            let high = max_d.max(12).max(low);
+            return rng.gen_range(low..=high);
         }
 
-        // Fast cruise speed: mostly 1~3ms with occasional 4~5ms
+        // Fast cruise speed: mostly min_delay_ms with occasional slight bump
         let base_delay = if normalized_vel > 0.8 {
             if rng.gen_bool(0.85) {
-                profile.min_delay_ms
+                min_d
             } else {
-                profile.min_delay_ms + 2
+                (min_d + 2).min(max_d)
             }
         } else if normalized_vel > 0.4 {
-            rng.gen_range(profile.min_delay_ms + 1..=profile.max_delay_ms / 2 + 3)
+            let low = (min_d + 1).min(max_d);
+            let high = (max_d / 2 + 3).clamp(low, max_d);
+            rng.gen_range(low..=high)
         } else {
-            rng.gen_range(profile.min_delay_ms + 3..=profile.max_delay_ms)
+            let low = (min_d + 3).min(max_d);
+            rng.gen_range(low..=max_d)
         };
 
-        // Rare micro-hesitation (1% probability, 25~60ms) simulating human cognition
+        // Rare micro-hesitation (1.2% probability, 25~60ms) simulating human cognition
         if rng.gen_bool(0.012) {
             base_delay + rng.gen_range(25..60)
         } else {
@@ -197,6 +229,8 @@ impl WindMousePlanner {
 
 impl TrajectoryPlanner for WindMousePlanner {
     fn generate(&self, start: Point, target: Point, profile: &Profile) -> Result<Vec<TrajectoryPoint>> {
+        profile.validate()?;
+
         let mut rng = thread_rng();
         let total_dist = start.distance_to(&target);
 
@@ -217,7 +251,11 @@ impl TrajectoryPlanner for WindMousePlanner {
             let uy = dy / mag;
 
             // Random overshoot distance and perpendicular jitter
-            let overshoot_dist = rng.gen_range(4.0..=profile.overshoot_radius);
+            let overshoot_dist = if profile.overshoot_radius > 4.0 {
+                rng.gen_range(4.0..=profile.overshoot_radius)
+            } else {
+                profile.overshoot_radius
+            };
             let perp_dist = rng.gen_range(-4.0..=4.0);
 
             Point::new(
@@ -257,7 +295,8 @@ impl TrajectoryPlanner for WindMousePlanner {
             .unwrap_or(true);
 
         if needs_final_snap {
-            let final_delay = rng.gen_range(profile.min_delay_ms..=profile.max_delay_ms.min(8));
+            let high = profile.max_delay_ms.min(8).max(profile.min_delay_ms);
+            let final_delay = rng.gen_range(profile.min_delay_ms..=high);
             current_elapsed_ms += final_delay as u64;
             full_points.push(TrajectoryPoint::new(
                 target_i32.0,
@@ -305,7 +344,7 @@ mod tests {
     fn test_gaussian_point_sampling() {
         let bbox = BoundingBox::new(200.0, 300.0, 100.0, 50.0);
         for _ in 0..100 {
-            let pt = WindMousePlanner::sample_gaussian_point(&bbox);
+            let pt = WindMousePlanner::sample_gaussian_point(&bbox).unwrap();
             assert!(pt.x >= bbox.x && pt.x <= bbox.x + bbox.width, "X must be within bbox");
             assert!(pt.y >= bbox.y && pt.y <= bbox.y + bbox.height, "Y must be within bbox");
         }
