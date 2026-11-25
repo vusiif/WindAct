@@ -163,13 +163,18 @@ impl KeyCode {
 /// Humanized typing rhythm configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct TypingConfig {
+    /// Inter-key delay inside an English word (fast burst).
     pub inter_key_min_ms: u32,
     pub inter_key_max_ms: u32,
+    /// Key press hold duration.
     pub hold_min_ms: u32,
     pub hold_max_ms: u32,
-    pub pause_chance: f64,
-    pub pause_min_ms: u32,
-    pub pause_max_ms: u32,
+    /// Post-space / post-punctuation cognitive pause between English words.
+    pub word_pause_min_ms: u32,
+    pub word_pause_max_ms: u32,
+    /// Pause between Chinese IME word chunks (simulating Pinyin typing + candidate selection).
+    pub cjk_chunk_pause_min_ms: u32,
+    pub cjk_chunk_pause_max_ms: u32,
 }
 
 impl Default for TypingConfig {
@@ -181,37 +186,40 @@ impl Default for TypingConfig {
 impl TypingConfig {
     pub fn casual() -> Self {
         Self {
-            inter_key_min_ms: 45,
-            inter_key_max_ms: 135,
-            hold_min_ms: 35,
-            hold_max_ms: 95,
-            pause_chance: 0.05,
-            pause_min_ms: 120,
-            pause_max_ms: 300,
+            inter_key_min_ms: 22,
+            inter_key_max_ms: 68,
+            hold_min_ms: 28,
+            hold_max_ms: 75,
+            word_pause_min_ms: 90,
+            word_pause_max_ms: 260,
+            cjk_chunk_pause_min_ms: 180,
+            cjk_chunk_pause_max_ms: 420,
         }
     }
 
     pub fn fast() -> Self {
         Self {
-            inter_key_min_ms: 20,
-            inter_key_max_ms: 65,
-            hold_min_ms: 20,
-            hold_max_ms: 55,
-            pause_chance: 0.02,
-            pause_min_ms: 80,
-            pause_max_ms: 160,
+            inter_key_min_ms: 12,
+            inter_key_max_ms: 40,
+            hold_min_ms: 18,
+            hold_max_ms: 45,
+            word_pause_min_ms: 45,
+            word_pause_max_ms: 140,
+            cjk_chunk_pause_min_ms: 90,
+            cjk_chunk_pause_max_ms: 220,
         }
     }
 
     pub fn slow() -> Self {
         Self {
-            inter_key_min_ms: 85,
-            inter_key_max_ms: 200,
-            hold_min_ms: 50,
-            hold_max_ms: 120,
-            pause_chance: 0.08,
-            pause_min_ms: 160,
-            pause_max_ms: 380,
+            inter_key_min_ms: 50,
+            inter_key_max_ms: 120,
+            hold_min_ms: 40,
+            hold_max_ms: 95,
+            word_pause_min_ms: 160,
+            word_pause_max_ms: 400,
+            cjk_chunk_pause_min_ms: 280,
+            cjk_chunk_pause_max_ms: 580,
         }
     }
 

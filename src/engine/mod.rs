@@ -323,7 +323,9 @@ impl<P: TrajectoryPlanner, I: InputInjector> ActionEngine<P, I> {
         })
     }
 
-    /// Types text with humanized key-hold durations, inter-key intervals, and natural pauses.
+    /// Types text with realistic human rhythm:
+    /// - English words: fast intra-word burst, then a natural cognitive pause after space/punctuation.
+    /// - Chinese/CJK: grouped into 1~4 char IME phrases committed rapidly together, with Pinyin thinking pauses between phrases.
     pub fn execute_send_text(
         &self,
         text: &str,
@@ -335,40 +337,101 @@ impl<P: TrajectoryPlanner, I: InputInjector> ActionEngine<P, I> {
             return Err(WindActError::InvalidInput("Text cannot contain null bytes".into()));
         }
 
-        let chars: Vec<char> = text.chars().collect();
         let mut rng = rand::thread_rng();
+        let chunks = tokenize_typing_chunks(text, &mut rng);
+        let char_count = text.chars().count();
         let mut total_ms = 0u64;
 
         let hold_low = cfg.hold_min_ms;
         let hold_high = cfg.hold_max_ms.max(hold_low);
         let inter_low = cfg.inter_key_min_ms;
         let inter_high = cfg.inter_key_max_ms.max(inter_low);
-        let pause_low = cfg.pause_min_ms;
-        let pause_high = cfg.pause_max_ms.max(pause_low);
+        let word_pause_low = cfg.word_pause_min_ms;
+        let word_pause_high = cfg.word_pause_max_ms.max(word_pause_low);
+        let cjk_pause_low = cfg.cjk_chunk_pause_min_ms;
+        let cjk_pause_high = cfg.cjk_chunk_pause_max_ms.max(cjk_pause_low);
 
-        for (idx, &ch) in chars.iter().enumerate() {
+        for (chunk_idx, chunk) in chunks.iter().enumerate() {
             if cancel.is_some_and(|f| f.load(std::sync::atomic::Ordering::Relaxed)) {
                 return Err(WindActError::Aborted);
             }
 
-            let hold_ms = rng.gen_range(hold_low..=hold_high);
-            total_ms += hold_ms as u64;
+            let is_last_chunk = chunk_idx + 1 == chunks.len();
 
-            if !dry_run {
-                self.injector.type_char_cancellable(ch, hold_ms, cancel)?;
-            }
-
-            if idx + 1 < chars.len() {
-                let mut wait_ms = rng.gen_range(inter_low..=inter_high);
-                // Add slight cognitive pause after punctuation, whitespace, or rare hesitation
-                let is_boundary = ch.is_whitespace() || matches!(ch, ',' | '.' | '!' | '?' | ';' | ':' | '，' | '。');
-                if is_boundary || rng.gen_bool(cfg.pause_chance.clamp(0.0, 1.0)) {
-                    wait_ms += rng.gen_range(pause_low..=pause_high);
+            match chunk {
+                TypingChunk::Word(word_chars) => {
+                    for (i, &ch) in word_chars.iter().enumerate() {
+                        let hold_ms = rng.gen_range(hold_low..=hold_high);
+                        total_ms += hold_ms as u64;
+                        if !dry_run {
+                            self.injector.type_char_cancellable(ch, hold_ms, cancel)?;
+                        }
+                        if i + 1 < word_chars.len() {
+                            let burst_ms = rng.gen_range(inter_low..=inter_high);
+                            total_ms += burst_ms as u64;
+                            if !dry_run
+                                && !hybrid_sleep_cancellable(Duration::from_millis(burst_ms as u64), cancel)
+                            {
+                                return Err(WindActError::Aborted);
+                            }
+                        }
+                    }
+                    // Tiny transition before following space/punctuation if not last
+                    if !is_last_chunk {
+                        let tail_ms = rng.gen_range(inter_low..=inter_high);
+                        total_ms += tail_ms as u64;
+                        if !dry_run
+                            && !hybrid_sleep_cancellable(Duration::from_millis(tail_ms as u64), cancel)
+                        {
+                            return Err(WindActError::Aborted);
+                        }
+                    }
                 }
-                total_ms += wait_ms as u64;
 
-                if !dry_run && !hybrid_sleep_cancellable(Duration::from_millis(wait_ms as u64), cancel) {
-                    return Err(WindActError::Aborted);
+                TypingChunk::Boundary(ch) => {
+                    let hold_ms = rng.gen_range(hold_low..=hold_high);
+                    total_ms += hold_ms as u64;
+                    if !dry_run {
+                        self.injector.type_char_cancellable(*ch, hold_ms, cancel)?;
+                    }
+                    // Cognitive thinking pause AFTER space or punctuation
+                    if !is_last_chunk {
+                        let pause_ms = rng.gen_range(word_pause_low..=word_pause_high);
+                        total_ms += pause_ms as u64;
+                        if !dry_run
+                            && !hybrid_sleep_cancellable(Duration::from_millis(pause_ms as u64), cancel)
+                        {
+                            return Err(WindActError::Aborted);
+                        }
+                    }
+                }
+
+                TypingChunk::CjkPhrase(phrase_chars) => {
+                    // IME commits an entire phrase almost instantaneously (0~3ms per char)
+                    for (i, &ch) in phrase_chars.iter().enumerate() {
+                        if !dry_run {
+                            self.injector.type_char_cancellable(ch, 0, cancel)?;
+                        }
+                        if i + 1 < phrase_chars.len() {
+                            let commit_gap = rng.gen_range(1..=4);
+                            total_ms += commit_gap;
+                            if !dry_run
+                                && !hybrid_sleep_cancellable(Duration::from_millis(commit_gap), cancel)
+                            {
+                                return Err(WindActError::Aborted);
+                            }
+                        }
+                    }
+                    // Pause between Chinese phrases (simulating typing Pinyin + selecting candidate)
+                    if !is_last_chunk {
+                        let phrase_pause = rng.gen_range(cjk_pause_low..=cjk_pause_high);
+                        total_ms += phrase_pause as u64;
+                        if !dry_run
+                            && !hybrid_sleep_cancellable(Duration::from_millis(phrase_pause as u64), cancel)
+                        {
+                            return Err(WindActError::Aborted);
+                        }
+                    }
                 }
             }
         }
@@ -376,7 +439,7 @@ impl<P: TrajectoryPlanner, I: InputInjector> ActionEngine<P, I> {
         Ok(ActionResult {
             id: None,
             status: "ok".to_string(),
-            total_points: Some(chars.len()),
+            total_points: Some(char_count),
             duration_ms: total_ms,
             points: None,
             error: None,
@@ -469,5 +532,111 @@ impl<P: TrajectoryPlanner, I: InputInjector> ActionEngine<P, I> {
             points: if dry_run { Some(trajectory) } else { None },
             error: None,
         }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum TypingChunk {
+    Word(Vec<char>),
+    Boundary(char),
+    CjkPhrase(Vec<char>),
+}
+
+#[inline]
+fn is_cjk_ideograph(ch: char) -> bool {
+    matches!(ch as u32,
+        0x4E00..=0x9FFF | // CJK Unified Ideographs
+        0x3400..=0x4DBF | // CJK Extension A
+        0xF900..=0xFAFF   // CJK Compatibility Ideographs
+    )
+}
+
+#[inline]
+fn is_boundary_char(ch: char) -> bool {
+    ch.is_whitespace() || matches!(ch, ',' | '.' | '!' | '?' | ';' | ':' | '，' | '。' | '！' | '？' | '；' | '：' | '、')
+}
+
+/// Splits text into fast-burst ASCII words, post-space/punctuation boundaries,
+/// and 1~4 character CJK IME phrases.
+fn tokenize_typing_chunks<R: Rng + ?Sized>(text: &str, rng: &mut R) -> Vec<TypingChunk> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut chunks = Vec::new();
+    let mut i = 0;
+
+    while i < chars.len() {
+        let ch = chars[i];
+        if is_boundary_char(ch) {
+            chunks.push(TypingChunk::Boundary(ch));
+            i += 1;
+        } else if is_cjk_ideograph(ch) {
+            // Group 1~4 CJK characters (weighted toward 2~3 char words) into one IME commit chunk
+            let max_phrase_len = match rng.gen_range(0..10) {
+                0..=1 => 1,
+                2..=6 => 2,
+                7..=8 => 3,
+                _ => 4,
+            };
+            let mut phrase = Vec::with_capacity(max_phrase_len);
+            while i < chars.len() && is_cjk_ideograph(chars[i]) && phrase.len() < max_phrase_len {
+                phrase.push(chars[i]);
+                i += 1;
+            }
+            chunks.push(TypingChunk::CjkPhrase(phrase));
+        } else {
+            let mut word = Vec::new();
+            while i < chars.len() && !is_boundary_char(chars[i]) && !is_cjk_ideograph(chars[i]) {
+                word.push(chars[i]);
+                i += 1;
+            }
+            chunks.push(TypingChunk::Word(word));
+        }
+    }
+
+    chunks
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_tokenize_mixed_english_and_cjk() {
+        let mut rng = rand::thread_rng();
+        let text = "Hello WindAct! 中文输入测试：你好";
+        let chunks = tokenize_typing_chunks(text, &mut rng);
+
+        // Reconstruct text from chunks to guarantee zero character loss
+        let mut reconstructed = String::new();
+        let mut saw_hello = false;
+        let mut saw_space = false;
+        let mut saw_cjk_phrase = false;
+
+        for c in &chunks {
+            match c {
+                TypingChunk::Word(w) => {
+                    let s: String = w.iter().collect();
+                    if s == "Hello" {
+                        saw_hello = true;
+                    }
+                    reconstructed.push_str(&s);
+                }
+                TypingChunk::Boundary(ch) => {
+                    if *ch == ' ' {
+                        saw_space = true;
+                    }
+                    reconstructed.push(*ch);
+                }
+                TypingChunk::CjkPhrase(p) => {
+                    assert!((1..=4).contains(&p.len()));
+                    saw_cjk_phrase = true;
+                    for ch in p {
+                        reconstructed.push(*ch);
+                    }
+                }
+            }
+        }
+
+        assert!(saw_hello && saw_space && saw_cjk_phrase);
+        assert_eq!(reconstructed, text);
     }
 }
