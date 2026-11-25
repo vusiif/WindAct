@@ -121,21 +121,28 @@ impl BezierSplinePlanner {
         let mut elapsed_ms = base_elapsed_ms;
         let trem_amp = (profile.wind * profile.noise_weight * 1.4).clamp(0.5, 4.5);
 
+        // Low-frequency arc-length-driven Perlin drift (1~2 smooth waves per curve, zero jaggedness)
+        let total_len = estimated_len.max(1.0);
+        let freq = 1.6 / total_len;
+        let phase_x = rng.gen_range(0.0..50.0);
+        let phase_y = rng.gen_range(50.0..100.0);
+
         for i in 1..=steps {
             let linear_t = i as f64 / steps as f64;
             let eased_t = Self::ease_in_out_sine(linear_t);
             let mut pt = eval_fn(eased_t);
 
             // Envelope tapers noise to 0 at start & end so endpoints remain exact
+            let s = linear_t * total_len;
             let envelope = (linear_t * std::f64::consts::PI).sin();
             let nx = self
                 .perlin
-                .noise(pt.x * profile.noise_scale, pt.y * profile.noise_scale, 13.0)
+                .noise(s * freq + phase_x, 0.25, 0.5)
                 * trem_amp
                 * envelope;
             let ny = self
                 .perlin
-                .noise(pt.x * profile.noise_scale, pt.y * profile.noise_scale, 79.0)
+                .noise(s * freq + phase_y, 0.75, 0.5)
                 * trem_amp
                 * envelope;
 

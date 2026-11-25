@@ -3,6 +3,7 @@
 use std::str::FromStr;
 use clap::{Parser, Subcommand};
 
+use windact::bench::run_benchmarks;
 use windact::core::{BoundingBox, MouseButton, Point, ScrollAxis, TypingConfig, WindActError};
 use windact::engine::ActionEngine;
 use windact::injector::default_injector;
@@ -161,6 +162,17 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         dry_run: bool,
     },
+
+    /// Run built-in 1ms timer jitter and trajectory planner throughput benchmarks.
+    Bench {
+        /// Number of sleep samples per interval (1ms, 2ms, 5ms).
+        #[arg(long, default_value_t = 100)]
+        samples: usize,
+
+        /// Number of iterations per trajectory planner throughput test.
+        #[arg(long, default_value_t = 500)]
+        iterations: usize,
+    },
 }
 
 fn parse_point(s: &str) -> Result<Point, WindActError> {
@@ -314,6 +326,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             hold_ms,
             dry_run,
         } => engine.execute_key_press(&key, hold_ms, dry_run, None)?,
+
+        Commands::Bench {
+            samples,
+            iterations,
+        } => {
+            let report = run_benchmarks(samples, iterations);
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            return Ok(());
+        }
     };
 
     println!("{}", serde_json::to_string_pretty(&result)?);

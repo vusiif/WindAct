@@ -1,5 +1,6 @@
 //! WindAct library root
 
+pub mod bench;
 pub mod core;
 pub mod engine;
 pub mod injector;

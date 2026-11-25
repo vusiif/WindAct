@@ -127,6 +127,11 @@ impl WindMousePlanner {
 
         let mut points = Vec::new();
         let mut elapsed_ms = base_elapsed_ms;
+        let initial_dist = start.distance_to(&destination).max(1.0);
+        let low_freq = 1.5 / initial_dist;
+        let phase_x = rng.gen_range(0.0..50.0);
+        let phase_y = rng.gen_range(50.0..100.0);
+        let mut traveled_dist = 0.0_f64;
 
         // Main physical simulation loop with hard iteration cap
         for _ in 0..MAX_SIMULATION_ITERATIONS {
@@ -159,16 +164,16 @@ impl WindMousePlanner {
                 }
             }
 
-            // Perlin noise continuous perturbation
+            // Low-frequency arc-length-driven Perlin drift (smooth physiological curve)
             let noise_x = self.perlin.noise(
-                current.x * profile.noise_scale,
-                current.y * profile.noise_scale,
+                traveled_dist * low_freq + phase_x,
+                0.25,
                 0.0,
             ) * profile.wind * profile.noise_weight * noise_damp;
 
             let noise_y = self.perlin.noise(
-                current.x * profile.noise_scale,
-                current.y * profile.noise_scale,
+                traveled_dist * low_freq + phase_y,
+                0.75,
                 100.0,
             ) * profile.wind * profile.noise_weight * noise_damp;
 
@@ -187,6 +192,7 @@ impl WindMousePlanner {
             // Update floating-point position
             current.x += velocity_x;
             current.y += velocity_y;
+            traveled_dist += (velocity_x * velocity_x + velocity_y * velocity_y).sqrt();
 
             let next_pos_i32 = (current.x.round() as i32, current.y.round() as i32);
 
