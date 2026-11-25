@@ -11,7 +11,7 @@ use serde::Deserialize;
 use crate::core::{ActionResult, BoundingBox, MouseButton, Point, Result, ScrollAxis, WindActError};
 use crate::engine::ActionEngine;
 use crate::injector::InputInjector;
-use crate::planner::{BezierSplinePlanner, TrajectoryPlanner, WindMousePlanner};
+use crate::planner::{BezierSplinePlanner, StrokeConfig, TrajectoryPlanner, WindMousePlanner};
 use crate::profile::Profile;
 
 fn default_casual() -> String {
@@ -80,6 +80,17 @@ pub enum StdioOp {
         axis: ScrollAxis,
         #[serde(default = "default_scroll_steps")]
         steps: u32,
+        #[serde(default)]
+        dry_run: bool,
+    },
+    DrawStrokes {
+        strokes: Vec<Vec<[f64; 2]>>,
+        #[serde(default)]
+        base_speed: Option<f64>,
+        #[serde(default)]
+        curvature_alpha: Option<f64>,
+        #[serde(default)]
+        drift_amplitude: Option<f64>,
         #[serde(default)]
         dry_run: bool,
     },
@@ -186,6 +197,30 @@ pub fn dispatch_command<P: TrajectoryPlanner, I: InputInjector>(
             steps,
             dry_run,
         } => engine.execute_scroll(delta, axis, steps, dry_run, cancel),
+
+        StdioOp::DrawStrokes {
+            strokes,
+            base_speed,
+            curvature_alpha,
+            drift_amplitude,
+            dry_run,
+        } => {
+            let mut cfg = StrokeConfig::default();
+            if let Some(v) = base_speed {
+                cfg.base_speed_px_per_ms = v;
+            }
+            if let Some(a) = curvature_alpha {
+                cfg.curvature_alpha = a;
+            }
+            if let Some(d) = drift_amplitude {
+                cfg.drift_amplitude_px = d;
+            }
+            let pts: Vec<Vec<Point>> = strokes
+                .into_iter()
+                .map(|s| s.into_iter().map(|p| Point::new(p[0], p[1])).collect())
+                .collect();
+            engine.execute_draw_strokes(&pts, &cfg, dry_run, cancel)
+        }
 
         StdioOp::Abort => Ok(ActionResult {
             id: Some(id),

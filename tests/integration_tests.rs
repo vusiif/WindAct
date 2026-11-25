@@ -284,3 +284,96 @@ fn test_bezier_spline_planner_curves_and_waypoints() {
         assert!(points[i].elapsed_ms >= points[i - 1].elapsed_ms);
     }
 }
+
+#[test]
+fn test_stroke_planner_two_thirds_power_law() {
+    use windact::planner::{StrokeConfig, StrokePlanner};
+
+    let planner = StrokePlanner::new();
+    let cfg = StrokeConfig {
+        base_speed_px_per_ms: 1.5,
+        curvature_alpha: 60.0,
+        drift_amplitude_px: 0.0, // isolate curvature effect
+        overshoot_min_px: 3.0,
+        overshoot_max_px: 3.0,
+        ..Default::default()
+    };
+
+    // Sharp 90-degree turn at (300, 100)
+    let pts = planner
+        .generate_stroke(
+            &[
+                Point::new(100.0, 100.0),
+                Point::new(300.0, 100.0),
+                Point::new(300.0, 300.0),
+            ],
+            &cfg,
+        )
+        .unwrap();
+
+    assert!(pts.len() >= 30);
+    // Tangent overshoot should extend slightly past y=300
+    assert!(pts.last().unwrap().y >= 302);
+
+    // Measure speed (px/ms) in straight middle vs near corner (x~300, y~100)
+    let straight_speeds: Vec<f64> = pts
+        .windows(2)
+        .filter(|w| w[0].x > 140 && w[1].x < 240 && w[0].delay_ms > 0)
+        .map(|w| {
+            let d = (((w[1].x - w[0].x).pow(2) + (w[1].y - w[0].y).pow(2)) as f64).sqrt();
+            d / w[1].delay_ms as f64
+        })
+        .collect();
+
+    let corner_speeds: Vec<f64> = pts
+        .windows(2)
+        .filter(|w| (w[0].x - 300).abs() < 15 && (w[0].y - 100).abs() < 15)
+        .map(|w| {
+            let d = (((w[1].x - w[0].x).pow(2) + (w[1].y - w[0].y).pow(2)) as f64).sqrt();
+            d / w[1].delay_ms.max(1) as f64
+        })
+        .collect();
+
+    assert!(!straight_speeds.is_empty() && !corner_speeds.is_empty());
+    let avg_straight = straight_speeds.iter().sum::<f64>() / straight_speeds.len() as f64;
+    let avg_corner = corner_speeds.iter().sum::<f64>() / corner_speeds.len() as f64;
+    assert!(
+        avg_straight > avg_corner,
+        "Straight speed ({avg_straight:.3}) should exceed corner speed ({avg_corner:.3})"
+    );
+}
+
+#[test]
+fn test_draw_strokes_stdio_and_abort_safety() {
+    let engine = Arc::new(ActionEngine::new(WindMousePlanner::new(), TestInjector::default()));
+
+    // Verify stdio JSONL draw_strokes dry_run
+    let json = r#"{"id": 10, "op": "draw_strokes", "strokes": [[[100,100],[250,100]],[[200,100],[200,250]]], "dry_run": true}"#;
+    let cmd: StdioCommand = serde_json::from_str(json).unwrap();
+    let res = dispatch_command(&engine, cmd, None);
+    assert_eq!(res.id, Some(10));
+    assert_eq!(res.status, "ok");
+    assert!(res.points.is_some());
+
+    // Verify mid-stroke abort safely releases button
+    let cancel = Arc::new(AtomicBool::new(false));
+    let e_worker = Arc::clone(&engine);
+    let c_worker = Arc::clone(&cancel);
+
+    let handle = thread::spawn(move || {
+        let strokes = vec![
+            vec![Point::new(100.0, 100.0), Point::new(800.0, 100.0), Point::new(800.0, 600.0)],
+            vec![Point::new(200.0, 200.0), Point::new(900.0, 500.0)],
+        ];
+        e_worker.execute_draw_strokes(&strokes, &windact::planner::StrokeConfig::default(), false, Some(&c_worker))
+    });
+
+    thread::sleep(Duration::from_millis(80));
+    cancel.store(true, Ordering::SeqCst);
+    let abort_res = handle.join().unwrap();
+    assert!(matches!(abort_res, Err(WindActError::Aborted)));
+
+    let pressed = engine.injector().press_count.load(Ordering::SeqCst);
+    let released = engine.injector().release_count.load(Ordering::SeqCst);
+    assert_eq!(pressed, released, "Left button must be released after draw_strokes abort");
+}

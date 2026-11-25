@@ -1,7 +1,9 @@
 //! Trajectory planning algorithms and implementations.
 
 pub mod bezier;
+pub mod stroke;
 pub use bezier::BezierSplinePlanner;
+pub use stroke::{StrokeConfig, StrokePlanner};
 
 use std::f64::consts::PI;
 use rand::prelude::*;

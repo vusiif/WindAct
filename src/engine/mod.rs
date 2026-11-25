@@ -8,7 +8,7 @@ use crate::core::{
     ActionResult, MouseButton, Point, Result, ScrollAxis, TrajectoryPoint, WindActError,
 };
 use crate::injector::{hybrid_sleep_cancellable, InputInjector};
-use crate::planner::TrajectoryPlanner;
+use crate::planner::{StrokeConfig, StrokePlanner, TrajectoryPlanner};
 use crate::profile::Profile;
 
 /// Coordinates trajectory generation and cancellable OS input execution.
@@ -233,6 +233,91 @@ impl<P: TrajectoryPlanner, I: InputInjector> ActionEngine<P, I> {
             total_points: Some(step_count as usize),
             duration_ms: total_ms,
             points: None,
+            error: None,
+        })
+    }
+
+    /// Executes a sequence of handwriting strokes with full physical lifecycle:
+    /// - Airborne WindMouse transitions between strokes (pen lifted)
+    /// - Landing dwell (15~35ms) after LeftDown before moving
+    /// - Two-Thirds Power Law curvature-velocity coupling + terminal flick overshoot
+    /// - Guaranteed LeftUp release even on mid-stroke abort
+    pub fn execute_draw_strokes(
+        &self,
+        strokes: &[Vec<Point>],
+        cfg: &StrokeConfig,
+        dry_run: bool,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<ActionResult> {
+        if strokes.is_empty() {
+            return Err(WindActError::InvalidInput("strokes cannot be empty".into()));
+        }
+
+        let stroke_planner = StrokePlanner::new();
+        let mut rng = rand::thread_rng();
+        let mut total_ms = 0u64;
+        let mut all_points = Vec::new();
+
+        let mut cursor_pos = if !dry_run {
+            self.injector.current_cursor_pos().unwrap_or(strokes[0][0])
+        } else {
+            strokes[0][0]
+        };
+
+        for (idx, waypoints) in strokes.iter().enumerate() {
+            if cancel.is_some_and(|f| f.load(std::sync::atomic::Ordering::Relaxed)) {
+                return Err(WindActError::Aborted);
+            }
+
+            let stroke_start = waypoints
+                .first()
+                .copied()
+                .ok_or_else(|| WindActError::InvalidInput("Stroke cannot be empty".into()))?;
+
+            // 1. Airborne transition between strokes using WindMouse
+            if !dry_run && (idx > 0 || cursor_pos.distance_to(&stroke_start) > 3.0) {
+                let airborne = self.planner.generate(cursor_pos, stroke_start, &Profile::fast())?;
+                total_ms += airborne.last().map(|p| p.elapsed_ms).unwrap_or(0);
+                self.injector.play_trajectory_cancellable(&airborne, cancel)?;
+            } else if !dry_run {
+                let (sx, sy) = stroke_start.to_i32();
+                self.injector.move_cursor(sx, sy)?;
+            }
+
+            // 2. Plan stroke geometry + kinematics
+            let stroke_pts = stroke_planner.generate_stroke(waypoints, cfg)?;
+            let stroke_ms = stroke_pts.last().map(|p| p.elapsed_ms).unwrap_or(0);
+            let dwell_ms = rng.gen_range(cfg.landing_dwell_min_ms..=cfg.landing_dwell_max_ms);
+            total_ms += dwell_ms as u64 + stroke_ms;
+
+            if dry_run {
+                all_points.extend(stroke_pts);
+            } else {
+                // 3. Pen down + landing dwell + stroke playback + guaranteed pen up
+                self.injector.press_button(MouseButton::Left)?;
+                let play_res = (|| -> Result<()> {
+                    if !hybrid_sleep_cancellable(Duration::from_millis(dwell_ms as u64), cancel) {
+                        return Err(WindActError::Aborted);
+                    }
+                    self.injector.play_trajectory_cancellable(&stroke_pts, cancel)?;
+                    Ok(())
+                })();
+                let release_res = self.injector.release_button(MouseButton::Left);
+                play_res?;
+                release_res?;
+
+                if let Some(last) = stroke_pts.last() {
+                    cursor_pos = Point::new(last.x as f64, last.y as f64);
+                }
+            }
+        }
+
+        Ok(ActionResult {
+            id: None,
+            status: "ok".to_string(),
+            total_points: Some(all_points.len()),
+            duration_ms: total_ms,
+            points: if dry_run { Some(all_points) } else { None },
             error: None,
         })
     }
