@@ -6,7 +6,7 @@ use clap::{Parser, Subcommand};
 use windact::core::{BoundingBox, MouseButton, Point, ScrollAxis, WindActError};
 use windact::engine::ActionEngine;
 use windact::injector::default_injector;
-use windact::planner::WindMousePlanner;
+use windact::planner::{BezierSplinePlanner, TrajectoryPlanner, WindMousePlanner};
 use windact::profile::Profile;
 use windact::stdio::run_stdio_loop;
 
@@ -50,6 +50,10 @@ enum Commands {
         #[arg(long, default_value = "casual")]
         profile: String,
 
+        /// Trajectory planner algorithm (windmouse, bezier).
+        #[arg(long, default_value = "windmouse")]
+        planner: String,
+
         /// Output calculated trajectory JSON without injecting OS physical input.
         #[arg(long, default_value_t = false)]
         dry_run: bool,
@@ -57,17 +61,25 @@ enum Commands {
 
     /// Generate or execute a humanized drag-and-drop action.
     Drag {
-        /// Start coordinate formatted as "x,y".
+        /// Start coordinate formatted as "x,y" (required unless --path is provided).
         #[arg(long)]
-        from: String,
+        from: Option<String>,
 
-        /// Destination coordinate formatted as "x,y".
+        /// Destination coordinate formatted as "x,y" (required unless --path is provided).
         #[arg(long)]
-        to: String,
+        to: Option<String>,
+
+        /// Multi-waypoint path formatted as "x1,y1;x2,y2;x3,y3" for continuous curved drag.
+        #[arg(long)]
+        path: Option<String>,
 
         /// Movement profile (casual, precise, slider, fast).
         #[arg(long, default_value = "slider")]
         profile: String,
+
+        /// Trajectory planner algorithm (windmouse, bezier). Defaults to bezier when --path is used.
+        #[arg(long)]
+        planner: Option<String>,
 
         /// Output calculated trajectory JSON without injecting OS physical input.
         #[arg(long, default_value_t = false)]
@@ -91,6 +103,10 @@ enum Commands {
         /// Movement profile (casual, precise, slider, fast).
         #[arg(long, default_value = "casual")]
         profile: String,
+
+        /// Trajectory planner algorithm (windmouse, bezier).
+        #[arg(long, default_value = "windmouse")]
+        planner: String,
 
         /// Output calculated trajectory JSON without injecting OS physical input.
         #[arg(long, default_value_t = false)]
@@ -131,6 +147,14 @@ fn parse_point(s: &str) -> Result<Point, WindActError> {
     Ok(Point::new(x, y))
 }
 
+fn parse_path(s: &str) -> Result<Vec<Point>, WindActError> {
+    s.split(';')
+        .map(|seg| seg.trim())
+        .filter(|seg| !seg.is_empty())
+        .map(parse_point)
+        .collect()
+}
+
 fn parse_bbox(s: &str) -> Result<BoundingBox, WindActError> {
     let parts: Vec<&str> = s.split(',').map(|p| p.trim()).collect();
     if parts.len() != 4 {
@@ -143,8 +167,24 @@ fn parse_bbox(s: &str) -> Result<BoundingBox, WindActError> {
     Ok(BoundingBox::new(vals[0], vals[1], vals[2], vals[3]))
 }
 
+fn select_planner<'a>(
+    name: &str,
+    windmouse: &'a WindMousePlanner,
+    bezier: &'a BezierSplinePlanner,
+) -> Result<&'a dyn TrajectoryPlanner, WindActError> {
+    match name.to_lowercase().as_str() {
+        "windmouse" => Ok(windmouse),
+        "bezier" => Ok(bezier),
+        other => Err(WindActError::InvalidInput(format!(
+            "Unknown planner '{other}'. Expected 'windmouse' or 'bezier'"
+        ))),
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
+    let windmouse = WindMousePlanner::new();
+    let bezier = BezierSplinePlanner::new();
     let engine = ActionEngine::new(WindMousePlanner::new(), default_injector());
 
     if cli.stdio {
@@ -165,6 +205,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             start,
             button,
             profile,
+            planner,
             dry_run,
         } => {
             let start_pt = start.as_deref().map(parse_point).transpose()?;
@@ -178,19 +219,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
             let profile_cfg = Profile::from_name(&profile)?;
-            engine.execute_click(start_pt, target_pt, button, &profile_cfg, dry_run, None)?
+            let selected = select_planner(&planner, &windmouse, &bezier)?;
+            engine.execute_click_with(selected, start_pt, target_pt, button, &profile_cfg, dry_run, None)?
         }
 
         Commands::Drag {
             from,
             to,
+            path,
             profile,
+            planner,
             dry_run,
         } => {
-            let start_pt = parse_point(&from)?;
-            let target_pt = parse_point(&to)?;
+            let waypoints = match (path, from, to) {
+                (Some(p), _, _) => parse_path(&p)?,
+                (None, Some(f), Some(t)) => vec![parse_point(&f)?, parse_point(&t)?],
+                _ => {
+                    return Err(Box::new(WindActError::InvalidInput(
+                        "Drag requires either --path or both --from and --to".into(),
+                    )));
+                }
+            };
             let profile_cfg = Profile::from_name(&profile)?;
-            engine.execute_drag(start_pt, target_pt, &profile_cfg, dry_run, None)?
+            let planner_name = planner
+                .as_deref()
+                .unwrap_or(if waypoints.len() > 2 { "bezier" } else { "windmouse" });
+            let selected = select_planner(planner_name, &windmouse, &bezier)?;
+            engine.execute_drag_path_with(selected, &waypoints, &profile_cfg, dry_run, None)?
         }
 
         Commands::Move {
@@ -198,12 +253,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             y,
             start,
             profile,
+            planner,
             dry_run,
         } => {
             let start_pt = start.as_deref().map(parse_point).transpose()?;
             let target_pt = Point::new(x, y);
             let profile_cfg = Profile::from_name(&profile)?;
-            engine.execute_move(start_pt, target_pt, &profile_cfg, dry_run, None)?
+            let selected = select_planner(&planner, &windmouse, &bezier)?;
+            engine.execute_move_with(selected, start_pt, target_pt, &profile_cfg, dry_run, None)?
         }
 
         Commands::Scroll {

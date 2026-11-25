@@ -11,7 +11,7 @@ use serde::Deserialize;
 use crate::core::{ActionResult, BoundingBox, MouseButton, Point, Result, ScrollAxis, WindActError};
 use crate::engine::ActionEngine;
 use crate::injector::InputInjector;
-use crate::planner::{TrajectoryPlanner, WindMousePlanner};
+use crate::planner::{BezierSplinePlanner, TrajectoryPlanner, WindMousePlanner};
 use crate::profile::Profile;
 
 fn default_casual() -> String {
@@ -48,6 +48,8 @@ pub enum StdioOp {
         #[serde(default = "default_casual")]
         profile: String,
         #[serde(default)]
+        planner: Option<String>,
+        #[serde(default)]
         dry_run: bool,
     },
     Move {
@@ -57,13 +59,18 @@ pub enum StdioOp {
         #[serde(default = "default_casual")]
         profile: String,
         #[serde(default)]
+        planner: Option<String>,
+        #[serde(default)]
         dry_run: bool,
     },
     Drag {
-        from: [f64; 2],
-        to: [f64; 2],
+        from: Option<[f64; 2]>,
+        to: Option<[f64; 2]>,
+        path: Option<Vec<[f64; 2]>>,
         #[serde(default = "default_slider")]
         profile: String,
+        #[serde(default)]
+        planner: Option<String>,
         #[serde(default)]
         dry_run: bool,
     },
@@ -79,6 +86,21 @@ pub enum StdioOp {
     Abort,
 }
 
+fn select_planner<'a, P: TrajectoryPlanner>(
+    name: Option<&str>,
+    default_planner: &'a P,
+    bezier: &'a BezierSplinePlanner,
+) -> Result<&'a dyn TrajectoryPlanner> {
+    match name.map(|s| s.to_lowercase()).as_deref() {
+        None | Some("default") => Ok(default_planner),
+        Some("windmouse") => Ok(default_planner),
+        Some("bezier") => Ok(bezier),
+        Some(other) => Err(WindActError::InvalidInput(format!(
+            "Unknown planner '{other}'. Expected 'windmouse' or 'bezier'"
+        ))),
+    }
+}
+
 /// Dispatches a single parsed command (excluding `Abort`) against the `ActionEngine`.
 pub fn dispatch_command<P: TrajectoryPlanner, I: InputInjector>(
     engine: &ActionEngine<P, I>,
@@ -87,6 +109,7 @@ pub fn dispatch_command<P: TrajectoryPlanner, I: InputInjector>(
 ) -> ActionResult {
     let start_time = Instant::now();
     let id = cmd.id;
+    let bezier = BezierSplinePlanner::new();
 
     let res: Result<ActionResult> = match cmd.op {
         StdioOp::MoveClick {
@@ -96,9 +119,11 @@ pub fn dispatch_command<P: TrajectoryPlanner, I: InputInjector>(
             start,
             button,
             profile,
+            planner,
             dry_run,
         } => (|| {
             let profile_cfg = Profile::from_name(&profile)?;
+            let selected = select_planner(planner.as_deref(), engine.planner(), &bezier)?;
             let target = match (bbox, x, y) {
                 (Some(b), _, _) => WindMousePlanner::sample_gaussian_point(&BoundingBox::new(
                     b[0], b[1], b[2], b[3],
@@ -111,7 +136,7 @@ pub fn dispatch_command<P: TrajectoryPlanner, I: InputInjector>(
                 }
             };
             let start_pt = start.map(|s| Point::new(s[0], s[1]));
-            engine.execute_click(start_pt, target, button, &profile_cfg, dry_run, cancel)
+            engine.execute_click_with(selected, start_pt, target, button, &profile_cfg, dry_run, cancel)
         })(),
 
         StdioOp::Move {
@@ -119,27 +144,40 @@ pub fn dispatch_command<P: TrajectoryPlanner, I: InputInjector>(
             y,
             start,
             profile,
+            planner,
             dry_run,
         } => (|| {
             let profile_cfg = Profile::from_name(&profile)?;
+            let selected = select_planner(planner.as_deref(), engine.planner(), &bezier)?;
             let start_pt = start.map(|s| Point::new(s[0], s[1]));
-            engine.execute_move(start_pt, Point::new(x, y), &profile_cfg, dry_run, cancel)
+            engine.execute_move_with(selected, start_pt, Point::new(x, y), &profile_cfg, dry_run, cancel)
         })(),
 
         StdioOp::Drag {
             from,
             to,
+            path,
             profile,
+            planner,
             dry_run,
         } => (|| {
             let profile_cfg = Profile::from_name(&profile)?;
-            engine.execute_drag(
-                Point::new(from[0], from[1]),
-                Point::new(to[0], to[1]),
-                &profile_cfg,
-                dry_run,
-                cancel,
-            )
+            let waypoints: Vec<Point> = match (path, from, to) {
+                (Some(pts), _, _) => pts.into_iter().map(|p| Point::new(p[0], p[1])).collect(),
+                (None, Some(f), Some(t)) => vec![Point::new(f[0], f[1]), Point::new(t[0], t[1])],
+                _ => {
+                    return Err(WindActError::InvalidInput(
+                        "drag requires either 'path' or both 'from' and 'to'".into(),
+                    ));
+                }
+            };
+            // Default to Bezier spline automatically for multi-waypoint curves unless overridden
+            let selected: &dyn TrajectoryPlanner = if planner.is_none() && waypoints.len() > 2 {
+                &bezier
+            } else {
+                select_planner(planner.as_deref(), engine.planner(), &bezier)?
+            };
+            engine.execute_drag_path_with(selected, &waypoints, &profile_cfg, dry_run, cancel)
         })(),
 
         StdioOp::Scroll {

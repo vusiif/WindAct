@@ -1,5 +1,8 @@
 //! Trajectory planning algorithms and implementations.
 
+pub mod bezier;
+pub use bezier::BezierSplinePlanner;
+
 use std::f64::consts::PI;
 use rand::prelude::*;
 
@@ -14,6 +17,28 @@ const MAX_SIMULATION_ITERATIONS: usize = 10_000;
 pub trait TrajectoryPlanner: Send + Sync {
     /// Generates a human-like mouse movement path from `start` to `target`.
     fn generate(&self, start: Point, target: Point, profile: &Profile) -> Result<Vec<TrajectoryPoint>>;
+
+    /// Generates a continuous trajectory through multiple waypoints.
+    /// Default implementation chains pairwise `generate` calls.
+    fn generate_path(&self, waypoints: &[Point], profile: &Profile) -> Result<Vec<TrajectoryPoint>> {
+        if waypoints.len() < 2 {
+            return Err(WindActError::InvalidInput(
+                "Path requires at least 2 waypoints".into(),
+            ));
+        }
+        let start_i32 = waypoints[0].to_i32();
+        let mut full = vec![TrajectoryPoint::new(start_i32.0, start_i32.1, 0, 0)];
+        let mut base_elapsed = 0u64;
+
+        for pair in waypoints.windows(2) {
+            let seg = self.generate(pair[0], pair[1], profile)?;
+            for pt in seg.into_iter().skip(1) {
+                base_elapsed += pt.delay_ms as u64;
+                full.push(TrajectoryPoint::new(pt.x, pt.y, pt.delay_ms, base_elapsed));
+            }
+        }
+        Ok(full)
+    }
 }
 
 /// Enhanced WindMouse trajectory planner with Perlin noise perturbation,

@@ -252,4 +252,35 @@ fn test_stdio_dispatch_commands_and_scroll() {
     assert_eq!(res3.id, Some(3));
     assert_eq!(res3.status, "ok");
     assert_eq!(engine.injector().scroll_sum.load(Ordering::SeqCst), -7);
+
+    let path_drag_json = r#"{"id": 4, "op": "drag", "path": [[100,100],[250,105],[220,240]], "profile": "casual", "dry_run": true}"#;
+    let cmd4: StdioCommand = serde_json::from_str(path_drag_json).unwrap();
+    let res4 = dispatch_command(&engine, cmd4, None);
+    assert_eq!(res4.id, Some(4));
+    assert_eq!(res4.status, "ok");
+    let pts = res4.points.expect("dry_run should include points");
+    assert_eq!((pts.first().unwrap().x, pts.first().unwrap().y), (100, 100));
+    assert_eq!((pts.last().unwrap().x, pts.last().unwrap().y), (220, 240));
+}
+
+#[test]
+fn test_bezier_spline_planner_curves_and_waypoints() {
+    use windact::planner::BezierSplinePlanner;
+
+    let planner = BezierSplinePlanner::new();
+    let profile = Profile::casual();
+    let waypoints = [
+        Point::new(100.0, 100.0),
+        Point::new(220.0, 100.0),
+        Point::new(190.0, 220.0),
+    ];
+
+    let points = planner.generate_path(&waypoints, &profile).unwrap();
+    assert!(points.len() >= 20, "Spline path should have dense smooth points");
+    assert_eq!((points[0].x, points[0].y), (100, 100));
+    assert_eq!((points.last().unwrap().x, points.last().unwrap().y), (190, 220));
+
+    for i in 1..points.len() {
+        assert!(points[i].elapsed_ms >= points[i - 1].elapsed_ms);
+    }
 }

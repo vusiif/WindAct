@@ -26,6 +26,10 @@ impl<P: TrajectoryPlanner, I: InputInjector> ActionEngine<P, I> {
         &self.injector
     }
 
+    pub fn planner(&self) -> &P {
+        &self.planner
+    }
+
     /// Resolves start coordinate, falling back to current cursor position or (0, 0).
     pub fn resolve_start(&self, explicit_start: Option<Point>) -> Point {
         explicit_start.unwrap_or_else(|| {
@@ -44,8 +48,21 @@ impl<P: TrajectoryPlanner, I: InputInjector> ActionEngine<P, I> {
         dry_run: bool,
         cancel: Option<&AtomicBool>,
     ) -> Result<ActionResult> {
+        self.execute_move_with(&self.planner, start, target, profile, dry_run, cancel)
+    }
+
+    /// Moves cursor using an explicit planner implementation.
+    pub fn execute_move_with(
+        &self,
+        planner: &dyn TrajectoryPlanner,
+        start: Option<Point>,
+        target: Point,
+        profile: &Profile,
+        dry_run: bool,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<ActionResult> {
         let start_pt = self.resolve_start(start);
-        let trajectory = self.planner.generate(start_pt, target, profile)?;
+        let trajectory = planner.generate(start_pt, target, profile)?;
         let duration_ms = trajectory.last().map(|p| p.elapsed_ms).unwrap_or(0);
 
         if !dry_run {
@@ -65,8 +82,23 @@ impl<P: TrajectoryPlanner, I: InputInjector> ActionEngine<P, I> {
         dry_run: bool,
         cancel: Option<&AtomicBool>,
     ) -> Result<ActionResult> {
+        self.execute_click_with(&self.planner, start, target, button, profile, dry_run, cancel)
+    }
+
+    /// Clicks using an explicit planner implementation.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_click_with(
+        &self,
+        planner: &dyn TrajectoryPlanner,
+        start: Option<Point>,
+        target: Point,
+        button: MouseButton,
+        profile: &Profile,
+        dry_run: bool,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<ActionResult> {
         let start_pt = self.resolve_start(start);
-        let trajectory = self.planner.generate(start_pt, target, profile)?;
+        let trajectory = planner.generate(start_pt, target, profile)?;
         let move_ms = trajectory.last().map(|p| p.elapsed_ms).unwrap_or(0);
 
         let mut rng = rand::thread_rng();
@@ -80,8 +112,7 @@ impl<P: TrajectoryPlanner, I: InputInjector> ActionEngine<P, I> {
         Ok(Self::build_ok_result(trajectory, move_ms + hold_ms as u64, dry_run))
     }
 
-    /// Approaches `from` smoothly (if needed), holds left button, drags to `to`, hovers, and releases.
-    /// Guarantees left button release even if aborted mid-drag.
+    /// Approaches `from` smoothly, holds left button, drags to `to`, hovers, and releases.
     pub fn execute_drag(
         &self,
         from: Point,
@@ -90,15 +121,35 @@ impl<P: TrajectoryPlanner, I: InputInjector> ActionEngine<P, I> {
         dry_run: bool,
         cancel: Option<&AtomicBool>,
     ) -> Result<ActionResult> {
+        self.execute_drag_path_with(&self.planner, &[from, to], profile, dry_run, cancel)
+    }
+
+    /// Executes a continuous multi-waypoint drag using an explicit planner.
+    /// Guarantees left button release even if aborted mid-drag.
+    pub fn execute_drag_path_with(
+        &self,
+        planner: &dyn TrajectoryPlanner,
+        waypoints: &[Point],
+        profile: &Profile,
+        dry_run: bool,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<ActionResult> {
+        if waypoints.len() < 2 {
+            return Err(WindActError::InvalidInput(
+                "Drag path requires at least 2 waypoints".into(),
+            ));
+        }
+
+        let from = waypoints[0];
         let mut approach_trajectory = Vec::new();
         if !dry_run {
             let current_pos = self.injector.current_cursor_pos().unwrap_or(from);
             if current_pos.distance_to(&from) > 3.0 {
-                approach_trajectory = self.planner.generate(current_pos, from, &Profile::casual())?;
+                approach_trajectory = planner.generate(current_pos, from, &Profile::casual())?;
             }
         }
 
-        let drag_trajectory = self.planner.generate(from, to, profile)?;
+        let drag_trajectory = planner.generate_path(waypoints, profile)?;
         let mut rng = rand::thread_rng();
         let pre_drag_hold = rng.gen_range(20..=50);
         let hover_ms = rng.gen_range(profile.hover_min_ms..=profile.hover_max_ms);
