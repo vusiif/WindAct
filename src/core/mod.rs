@@ -70,15 +70,28 @@ pub enum MouseButton {
     Middle,
 }
 
+/// Mouse wheel scroll axis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum ScrollAxis {
+    #[default]
+    Vertical,
+    Horizontal,
+}
+
 /// Execution status result of a trajectory or action.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActionResult {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<u64>,
     pub status: String,
-    pub total_points: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_points: Option<usize>,
     pub duration_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub points: Option<Vec<TrajectoryPoint>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// Bounding box for Gaussian randomized destination sampling.

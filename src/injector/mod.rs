@@ -1,23 +1,54 @@
 //! Input injection layer for dispatching hardware/OS events.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::core::{MouseButton, Point, Result, TrajectoryPoint, WindActError};
+use crate::core::{MouseButton, Point, Result, ScrollAxis, TrajectoryPoint, WindActError};
 
 /// High-precision sleep combining thread sleep and CPU busy-spin loop.
 /// Yields the thread for the bulk of the wait, then spins to achieve sub-millisecond accuracy.
 pub fn hybrid_sleep(target_duration: Duration) {
-    let start = Instant::now();
-    if target_duration > Duration::from_millis(2) {
-        thread::sleep(target_duration - Duration::from_millis(1));
-    }
-    while start.elapsed() < target_duration {
-        std::hint::spin_loop();
-    }
+    let _ = hybrid_sleep_cancellable(target_duration, None);
 }
 
-/// Common trait for injecting mouse movement and button events into the OS.
+/// Cancellable high-precision sleep that checks an atomic abort flag every ~1ms.
+/// Returns `true` if the full duration elapsed, or `false` if cancelled early.
+pub fn hybrid_sleep_cancellable(target_duration: Duration, cancel: Option<&AtomicBool>) -> bool {
+    let start = Instant::now();
+    let check_cancelled = || cancel.is_some_and(|flag| flag.load(Ordering::Relaxed));
+
+    if check_cancelled() {
+        return false;
+    }
+
+    while let Some(remaining) = target_duration.checked_sub(start.elapsed()) {
+        if check_cancelled() {
+            return false;
+        }
+        if remaining > Duration::from_millis(2) {
+            // Sleep in 1ms slices when cancellable so abort responds within ~1-2ms
+            let slice = if cancel.is_some() {
+                Duration::from_millis(1)
+            } else {
+                remaining - Duration::from_millis(1)
+            };
+            thread::sleep(slice);
+        } else {
+            while start.elapsed() < target_duration {
+                if check_cancelled() {
+                    return false;
+                }
+                std::hint::spin_loop();
+            }
+            break;
+        }
+    }
+
+    !check_cancelled()
+}
+
+/// Common trait for injecting mouse movement, button, and scroll events into the OS.
 pub trait InputInjector: Send + Sync {
     /// Moves the cursor to physical screen coordinates (x, y).
     fn move_cursor(&self, x: i32, y: i32) -> Result<()>;
@@ -29,10 +60,32 @@ pub trait InputInjector: Send + Sync {
     fn release_button(&self, button: MouseButton) -> Result<()>;
 
     /// Clicks the specified mouse button with a humanized hold duration in milliseconds.
-    fn click_button(&self, button: MouseButton, hold_ms: u32) -> Result<()>;
+    fn click_button(&self, button: MouseButton, hold_ms: u32) -> Result<()> {
+        self.click_button_cancellable(button, hold_ms, None)
+    }
+
+    /// Clicks the specified mouse button with cancellation support during the hold period.
+    fn click_button_cancellable(
+        &self,
+        button: MouseButton,
+        hold_ms: u32,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<()>;
+
+    /// Scrolls the mouse wheel by `delta` notches (positive = up/right, negative = down/left).
+    fn scroll(&self, delta: i32, axis: ScrollAxis) -> Result<()>;
 
     /// Plays a sequence of pre-computed trajectory points with precise inter-step timing.
-    fn play_trajectory(&self, points: &[TrajectoryPoint]) -> Result<()>;
+    fn play_trajectory(&self, points: &[TrajectoryPoint]) -> Result<()> {
+        self.play_trajectory_cancellable(points, None)
+    }
+
+    /// Plays a trajectory while polling an optional atomic cancellation flag.
+    fn play_trajectory_cancellable(
+        &self,
+        points: &[TrajectoryPoint],
+        cancel: Option<&AtomicBool>,
+    ) -> Result<()>;
 
     /// Retrieves the current physical cursor location.
     fn current_cursor_pos(&self) -> Result<Point>;
@@ -52,13 +105,13 @@ pub mod windows {
     };
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
         SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEINPUT,
-        MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
+        MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
         MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE,
-        MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK,
+        MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         GetCursorPos, GetSystemMetrics, SM_CXSCREEN, SM_CXVIRTUALSCREEN,
-        SM_CYSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+        SM_CYSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, WHEEL_DELTA,
     };
 
     #[link(name = "winmm")]
@@ -161,14 +214,14 @@ pub mod windows {
             Self
         }
 
-        fn send_mouse_input(flags: u32, dx: i32, dy: i32) -> Result<()> {
+        fn send_mouse_input(flags: u32, mouse_data: u32, dx: i32, dy: i32) -> Result<()> {
             let input = INPUT {
                 r#type: INPUT_MOUSE,
                 Anonymous: INPUT_0 {
                     mi: MOUSEINPUT {
                         dx,
                         dy,
-                        mouseData: 0,
+                        mouseData: mouse_data,
                         dwFlags: flags,
                         time: 0,
                         dwExtraInfo: 0,
@@ -193,7 +246,7 @@ pub mod windows {
             let desktop = VirtualDesktop::capture();
             let (norm_x, norm_y) = desktop.normalize(x, y);
             let flags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
-            Self::send_mouse_input(flags, norm_x, norm_y)
+            Self::send_mouse_input(flags, 0, norm_x, norm_y)
         }
 
         fn press_button(&self, button: MouseButton) -> Result<()> {
@@ -202,7 +255,7 @@ pub mod windows {
                 MouseButton::Right => MOUSEEVENTF_RIGHTDOWN,
                 MouseButton::Middle => MOUSEEVENTF_MIDDLEDOWN,
             };
-            Self::send_mouse_input(flag, 0, 0)
+            Self::send_mouse_input(flag, 0, 0, 0)
         }
 
         fn release_button(&self, button: MouseButton) -> Result<()> {
@@ -211,18 +264,46 @@ pub mod windows {
                 MouseButton::Right => MOUSEEVENTF_RIGHTUP,
                 MouseButton::Middle => MOUSEEVENTF_MIDDLEUP,
             };
-            Self::send_mouse_input(flag, 0, 0)
+            Self::send_mouse_input(flag, 0, 0, 0)
         }
 
-        fn click_button(&self, button: MouseButton, hold_ms: u32) -> Result<()> {
+        fn click_button_cancellable(
+            &self,
+            button: MouseButton,
+            hold_ms: u32,
+            cancel: Option<&AtomicBool>,
+        ) -> Result<()> {
             self.press_button(button)?;
-            if hold_ms > 0 {
-                hybrid_sleep(Duration::from_millis(hold_ms as u64));
+            let completed = if hold_ms > 0 {
+                hybrid_sleep_cancellable(Duration::from_millis(hold_ms as u64), cancel)
+            } else {
+                true
+            };
+            // Always release button even if aborted mid-click
+            self.release_button(button)?;
+            if completed {
+                Ok(())
+            } else {
+                Err(WindActError::Aborted)
             }
-            self.release_button(button)
         }
 
-        fn play_trajectory(&self, points: &[TrajectoryPoint]) -> Result<()> {
+        fn scroll(&self, delta: i32, axis: ScrollAxis) -> Result<()> {
+            let wheel_delta = delta
+                .checked_mul(WHEEL_DELTA as i32)
+                .ok_or_else(|| WindActError::InvalidInput("Scroll delta overflow".into()))?;
+            let flag = match axis {
+                ScrollAxis::Vertical => MOUSEEVENTF_WHEEL,
+                ScrollAxis::Horizontal => MOUSEEVENTF_HWHEEL,
+            };
+            Self::send_mouse_input(flag, wheel_delta as u32, 0, 0)
+        }
+
+        fn play_trajectory_cancellable(
+            &self,
+            points: &[TrajectoryPoint],
+            cancel: Option<&AtomicBool>,
+        ) -> Result<()> {
             if points.is_empty() {
                 return Ok(());
             }
@@ -233,11 +314,16 @@ pub mod windows {
             let flags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
 
             for point in points {
-                if point.delay_ms > 0 {
-                    hybrid_sleep(Duration::from_millis(point.delay_ms as u64));
+                if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+                    return Err(WindActError::Aborted);
+                }
+                if point.delay_ms > 0
+                    && !hybrid_sleep_cancellable(Duration::from_millis(point.delay_ms as u64), cancel)
+                {
+                    return Err(WindActError::Aborted);
                 }
                 let (norm_x, norm_y) = desktop.normalize(point.x, point.y);
-                Self::send_mouse_input(flags, norm_x, norm_y)?;
+                Self::send_mouse_input(flags, 0, norm_x, norm_y)?;
             }
 
             Ok(())
@@ -263,7 +349,7 @@ pub mod windows {
 #[cfg(not(windows))]
 pub mod mock {
     use super::*;
-    use std::sync::atomic::{AtomicI32, Ordering};
+    use std::sync::atomic::AtomicI32;
 
     #[derive(Debug, Default)]
     pub struct MockInjector {
@@ -292,17 +378,41 @@ pub mod mock {
             Ok(())
         }
 
-        fn click_button(&self, _button: MouseButton, hold_ms: u32) -> Result<()> {
-            if hold_ms > 0 {
-                hybrid_sleep(Duration::from_millis(hold_ms as u64));
+        fn click_button_cancellable(
+            &self,
+            _button: MouseButton,
+            hold_ms: u32,
+            cancel: Option<&AtomicBool>,
+        ) -> Result<()> {
+            let completed = if hold_ms > 0 {
+                hybrid_sleep_cancellable(Duration::from_millis(hold_ms as u64), cancel)
+            } else {
+                true
+            };
+            if completed {
+                Ok(())
+            } else {
+                Err(WindActError::Aborted)
             }
+        }
+
+        fn scroll(&self, _delta: i32, _axis: ScrollAxis) -> Result<()> {
             Ok(())
         }
 
-        fn play_trajectory(&self, points: &[TrajectoryPoint]) -> Result<()> {
+        fn play_trajectory_cancellable(
+            &self,
+            points: &[TrajectoryPoint],
+            cancel: Option<&AtomicBool>,
+        ) -> Result<()> {
             for point in points {
-                if point.delay_ms > 0 {
-                    hybrid_sleep(Duration::from_millis(point.delay_ms as u64));
+                if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+                    return Err(WindActError::Aborted);
+                }
+                if point.delay_ms > 0
+                    && !hybrid_sleep_cancellable(Duration::from_millis(point.delay_ms as u64), cancel)
+                {
+                    return Err(WindActError::Aborted);
                 }
                 self.move_cursor(point.x, point.y)?;
             }
@@ -345,10 +455,18 @@ mod tests {
     }
 
     #[test]
+    fn test_cancellable_sleep_aborts_immediately() {
+        let cancel = AtomicBool::new(true);
+        let start = Instant::now();
+        let completed = hybrid_sleep_cancellable(Duration::from_millis(200), Some(&cancel));
+        assert!(!completed);
+        assert!(start.elapsed() < Duration::from_millis(10));
+    }
+
+    #[test]
     fn test_injector_creation() {
         let injector = default_injector();
         let pos = injector.current_cursor_pos();
-        // In interactive desktop sessions, pos is Ok(point). In headless/service runners, it may return AccessDenied.
         match pos {
             Ok(pt) => println!("Cursor position: ({}, {})", pt.x, pt.y),
             Err(e) => println!("Cursor position not available in headless environment: {e}"),

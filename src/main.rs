@@ -1,14 +1,14 @@
 //! WindAct CLI and execution entry point.
 
 use std::str::FromStr;
-use std::time::Duration;
 use clap::{Parser, Subcommand};
-use rand::Rng;
 
-use windact::core::{ActionResult, BoundingBox, MouseButton, Point, TrajectoryPoint, WindActError};
-use windact::injector::{default_injector, hybrid_sleep, InputInjector};
-use windact::planner::{TrajectoryPlanner, WindMousePlanner};
+use windact::core::{BoundingBox, MouseButton, Point, ScrollAxis, WindActError};
+use windact::engine::ActionEngine;
+use windact::injector::default_injector;
+use windact::planner::WindMousePlanner;
 use windact::profile::Profile;
+use windact::stdio::run_stdio_loop;
 
 /// WindAct: Physics-based human-like mouse trajectory generator & input injector.
 #[derive(Parser, Debug)]
@@ -96,6 +96,25 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         dry_run: bool,
     },
+
+    /// Execute a humanized mouse wheel scroll action.
+    Scroll {
+        /// Wheel notches to scroll (positive = up/right, negative = down/left).
+        #[arg(long, allow_hyphen_values = true)]
+        delta: i32,
+
+        /// Scroll axis (vertical, horizontal).
+        #[arg(long, default_value = "vertical")]
+        axis: ScrollAxis,
+
+        /// Number of humanized scroll sub-steps.
+        #[arg(long, default_value_t = 3)]
+        steps: u32,
+
+        /// Simulate timing without injecting OS wheel events.
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+    },
 }
 
 fn parse_point(s: &str) -> Result<Point, WindActError> {
@@ -124,37 +143,12 @@ fn parse_bbox(s: &str) -> Result<BoundingBox, WindActError> {
     Ok(BoundingBox::new(vals[0], vals[1], vals[2], vals[3]))
 }
 
-fn resolve_start_point(start: Option<String>, injector: &dyn InputInjector) -> Result<Point, WindActError> {
-    match start {
-        Some(s) => parse_point(&s),
-        None => Ok(injector.current_cursor_pos().unwrap_or(Point::new(0.0, 0.0))),
-    }
-}
-
-fn emit_result(
-    trajectory: Vec<TrajectoryPoint>,
-    extra_duration_ms: u64,
-    dry_run: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let move_duration = trajectory.last().map(|p| p.elapsed_ms).unwrap_or(0);
-    let result = ActionResult {
-        id: None,
-        status: "ok".to_string(),
-        total_points: trajectory.len(),
-        duration_ms: move_duration + extra_duration_ms,
-        points: if dry_run { Some(trajectory) } else { None },
-    };
-
-    let json_output = serde_json::to_string_pretty(&result)?;
-    println!("{json_output}");
-    Ok(())
-}
-
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
+    let engine = ActionEngine::new(WindMousePlanner::new(), default_injector());
 
     if cli.stdio {
-        eprintln!("Stdio JSONL mode will be fully operational in Phase 3.");
+        run_stdio_loop(engine)?;
         return Ok(());
     }
 
@@ -163,11 +157,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     };
 
-    let injector = default_injector();
-    let planner = WindMousePlanner::new();
-    let mut rng = rand::thread_rng();
-
-    match command {
+    let result = match command {
         Commands::Click {
             x,
             y,
@@ -177,8 +167,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             profile,
             dry_run,
         } => {
-            let start_point = resolve_start_point(start, &injector)?;
-            let target_point = match (bbox, x, y) {
+            let start_pt = start.as_deref().map(parse_point).transpose()?;
+            let target_pt = match (bbox, x, y) {
                 (Some(b), _, _) => WindMousePlanner::sample_gaussian_point(&parse_bbox(&b)?)?,
                 (None, Some(px), Some(py)) => Point::new(px, py),
                 _ => {
@@ -188,15 +178,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
             let profile_cfg = Profile::from_name(&profile)?;
-            let trajectory = planner.generate(start_point, target_point, &profile_cfg)?;
-
-            let hold_ms = rng.gen_range(profile_cfg.press_hold_min_ms..=profile_cfg.press_hold_max_ms);
-            if !dry_run {
-                injector.play_trajectory(&trajectory)?;
-                injector.click_button(button, hold_ms)?;
-            }
-
-            emit_result(trajectory, hold_ms as u64, dry_run)?;
+            engine.execute_click(start_pt, target_pt, button, &profile_cfg, dry_run, None)?
         }
 
         Commands::Drag {
@@ -205,45 +187,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             profile,
             dry_run,
         } => {
-            let start_point = parse_point(&from)?;
-            let target_point = parse_point(&to)?;
+            let start_pt = parse_point(&from)?;
+            let target_pt = parse_point(&to)?;
             let profile_cfg = Profile::from_name(&profile)?;
-
-            // Plan approach trajectory from current cursor position to `from` to avoid teleportation
-            let mut approach_trajectory = Vec::new();
-            if !dry_run {
-                let current_pos = injector.current_cursor_pos().unwrap_or(start_point);
-                if current_pos.distance_to(&start_point) > 3.0 {
-                    approach_trajectory = planner.generate(current_pos, start_point, &Profile::casual())?;
-                }
-            }
-
-            let drag_trajectory = planner.generate(start_point, target_point, &profile_cfg)?;
-            let pre_drag_hold = rng.gen_range(20..=50);
-            let hover_ms = rng.gen_range(profile_cfg.hover_min_ms..=profile_cfg.hover_max_ms);
-
-            if !dry_run {
-                if !approach_trajectory.is_empty() {
-                    injector.play_trajectory(&approach_trajectory)?;
-                } else {
-                    let (sx, sy) = start_point.to_i32();
-                    injector.move_cursor(sx, sy)?;
-                }
-                hybrid_sleep(Duration::from_millis(30));
-
-                injector.press_button(MouseButton::Left)?;
-                hybrid_sleep(Duration::from_millis(pre_drag_hold));
-
-                injector.play_trajectory(&drag_trajectory)?;
-
-                // Mandatory dwell / hover at destination before releasing (anti-rebound for sliders)
-                hybrid_sleep(Duration::from_millis(hover_ms as u64));
-                injector.release_button(MouseButton::Left)?;
-            }
-
-            let approach_ms = approach_trajectory.last().map(|p| p.elapsed_ms).unwrap_or(0);
-            let extra_ms = approach_ms + 30 + pre_drag_hold + hover_ms as u64;
-            emit_result(drag_trajectory, extra_ms, dry_run)?;
+            engine.execute_drag(start_pt, target_pt, &profile_cfg, dry_run, None)?
         }
 
         Commands::Move {
@@ -253,18 +200,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             profile,
             dry_run,
         } => {
-            let start_point = resolve_start_point(start, &injector)?;
-            let target_point = Point::new(x, y);
+            let start_pt = start.as_deref().map(parse_point).transpose()?;
+            let target_pt = Point::new(x, y);
             let profile_cfg = Profile::from_name(&profile)?;
-            let trajectory = planner.generate(start_point, target_point, &profile_cfg)?;
-
-            if !dry_run {
-                injector.play_trajectory(&trajectory)?;
-            }
-
-            emit_result(trajectory, 0, dry_run)?;
+            engine.execute_move(start_pt, target_pt, &profile_cfg, dry_run, None)?
         }
-    }
 
+        Commands::Scroll {
+            delta,
+            axis,
+            steps,
+            dry_run,
+        } => engine.execute_scroll(delta, axis, steps, dry_run, None)?,
+    };
+
+    println!("{}", serde_json::to_string_pretty(&result)?);
     Ok(())
 }
