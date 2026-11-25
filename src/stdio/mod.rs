@@ -8,7 +8,9 @@ use std::time::Instant;
 
 use serde::Deserialize;
 
-use crate::core::{ActionResult, BoundingBox, MouseButton, Point, Result, ScrollAxis, WindActError};
+use crate::core::{
+    ActionResult, BoundingBox, MouseButton, Point, Result, ScrollAxis, TypingConfig, WindActError,
+};
 use crate::engine::ActionEngine;
 use crate::injector::InputInjector;
 use crate::planner::{BezierSplinePlanner, StrokeConfig, TrajectoryPlanner, WindMousePlanner};
@@ -91,6 +93,20 @@ pub enum StdioOp {
         curvature_alpha: Option<f64>,
         #[serde(default)]
         drift_amplitude: Option<f64>,
+        #[serde(default)]
+        dry_run: bool,
+    },
+    SendText {
+        text: String,
+        #[serde(default = "default_casual")]
+        profile: String,
+        #[serde(default)]
+        dry_run: bool,
+    },
+    KeyPress {
+        key: String,
+        #[serde(default)]
+        hold_ms: Option<u32>,
         #[serde(default)]
         dry_run: bool,
     },
@@ -221,6 +237,21 @@ pub fn dispatch_command<P: TrajectoryPlanner, I: InputInjector>(
                 .collect();
             engine.execute_draw_strokes(&pts, &cfg, dry_run, cancel)
         }
+
+        StdioOp::SendText {
+            text,
+            profile,
+            dry_run,
+        } => (|| {
+            let cfg = TypingConfig::from_name(&profile)?;
+            engine.execute_send_text(&text, &cfg, dry_run, cancel)
+        })(),
+
+        StdioOp::KeyPress {
+            key,
+            hold_ms,
+            dry_run,
+        } => engine.execute_key_press(&key, hold_ms, dry_run, cancel),
 
         StdioOp::Abort => Ok(ActionResult {
             id: Some(id),

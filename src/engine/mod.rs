@@ -5,7 +5,8 @@ use std::time::Duration;
 use rand::Rng;
 
 use crate::core::{
-    ActionResult, MouseButton, Point, Result, ScrollAxis, TrajectoryPoint, WindActError,
+    ActionResult, KeyCode, MouseButton, Point, Result, ScrollAxis, TrajectoryPoint, TypingConfig,
+    WindActError,
 };
 use crate::injector::{hybrid_sleep_cancellable, InputInjector};
 use crate::planner::{StrokeConfig, StrokePlanner, TrajectoryPlanner};
@@ -318,6 +319,139 @@ impl<P: TrajectoryPlanner, I: InputInjector> ActionEngine<P, I> {
             total_points: Some(all_points.len()),
             duration_ms: total_ms,
             points: if dry_run { Some(all_points) } else { None },
+            error: None,
+        })
+    }
+
+    /// Types text with humanized key-hold durations, inter-key intervals, and natural pauses.
+    pub fn execute_send_text(
+        &self,
+        text: &str,
+        cfg: &TypingConfig,
+        dry_run: bool,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<ActionResult> {
+        if text.contains('\0') {
+            return Err(WindActError::InvalidInput("Text cannot contain null bytes".into()));
+        }
+
+        let chars: Vec<char> = text.chars().collect();
+        let mut rng = rand::thread_rng();
+        let mut total_ms = 0u64;
+
+        let hold_low = cfg.hold_min_ms;
+        let hold_high = cfg.hold_max_ms.max(hold_low);
+        let inter_low = cfg.inter_key_min_ms;
+        let inter_high = cfg.inter_key_max_ms.max(inter_low);
+        let pause_low = cfg.pause_min_ms;
+        let pause_high = cfg.pause_max_ms.max(pause_low);
+
+        for (idx, &ch) in chars.iter().enumerate() {
+            if cancel.is_some_and(|f| f.load(std::sync::atomic::Ordering::Relaxed)) {
+                return Err(WindActError::Aborted);
+            }
+
+            let hold_ms = rng.gen_range(hold_low..=hold_high);
+            total_ms += hold_ms as u64;
+
+            if !dry_run {
+                self.injector.type_char_cancellable(ch, hold_ms, cancel)?;
+            }
+
+            if idx + 1 < chars.len() {
+                let mut wait_ms = rng.gen_range(inter_low..=inter_high);
+                // Add slight cognitive pause after punctuation, whitespace, or rare hesitation
+                let is_boundary = ch.is_whitespace() || matches!(ch, ',' | '.' | '!' | '?' | ';' | ':' | '，' | '。');
+                if is_boundary || rng.gen_bool(cfg.pause_chance.clamp(0.0, 1.0)) {
+                    wait_ms += rng.gen_range(pause_low..=pause_high);
+                }
+                total_ms += wait_ms as u64;
+
+                if !dry_run && !hybrid_sleep_cancellable(Duration::from_millis(wait_ms as u64), cancel) {
+                    return Err(WindActError::Aborted);
+                }
+            }
+        }
+
+        Ok(ActionResult {
+            id: None,
+            status: "ok".to_string(),
+            total_points: Some(chars.len()),
+            duration_ms: total_ms,
+            points: None,
+            error: None,
+        })
+    }
+
+    /// Presses a single key or modifier combination (e.g. "enter", "ctrl+a", "ctrl+shift+s").
+    /// Uses staggered modifier press/release and guarantees all held keys are released on abort.
+    pub fn execute_key_press(
+        &self,
+        combo: &str,
+        hold_ms: Option<u32>,
+        dry_run: bool,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<ActionResult> {
+        let keys = KeyCode::parse_combo(combo)?;
+        let mut rng = rand::thread_rng();
+        let hold = hold_ms.unwrap_or_else(|| rng.gen_range(45..=100));
+        let mut total_ms = hold as u64;
+
+        let mut stagger_delays = Vec::with_capacity(keys.len().saturating_sub(1));
+        for _ in 0..keys.len().saturating_sub(1) {
+            let d = rng.gen_range(15..=35);
+            total_ms += d as u64 * 2;
+            stagger_delays.push(d);
+        }
+
+        if !dry_run {
+            let mut pressed = Vec::with_capacity(keys.len());
+            let press_res = (|| -> Result<()> {
+                for (i, &k) in keys.iter().enumerate() {
+                    if cancel.is_some_and(|f| f.load(std::sync::atomic::Ordering::Relaxed)) {
+                        return Err(WindActError::Aborted);
+                    }
+                    self.injector.key_down(k)?;
+                    pressed.push(k);
+                    if i < stagger_delays.len()
+                        && !hybrid_sleep_cancellable(Duration::from_millis(stagger_delays[i] as u64), cancel)
+                    {
+                        return Err(WindActError::Aborted);
+                    }
+                }
+                if hold > 0
+                    && !hybrid_sleep_cancellable(Duration::from_millis(hold as u64), cancel)
+                {
+                    return Err(WindActError::Aborted);
+                }
+                Ok(())
+            })();
+
+            // Always release all pressed keys in reverse order (LIFO)
+            let mut release_err = None;
+            for (idx, &k) in pressed.iter().rev().enumerate() {
+                if let Err(e) = self.injector.key_up(k)
+                    && release_err.is_none()
+                {
+                    release_err = Some(e);
+                }
+                if idx + 1 < pressed.len() {
+                    let _ = hybrid_sleep_cancellable(Duration::from_millis(stagger_delays[pressed.len() - 2 - idx] as u64), None);
+                }
+            }
+
+            press_res?;
+            if let Some(e) = release_err {
+                return Err(e);
+            }
+        }
+
+        Ok(ActionResult {
+            id: None,
+            status: "ok".to_string(),
+            total_points: Some(keys.len()),
+            duration_ms: total_ms,
+            points: None,
             error: None,
         })
     }

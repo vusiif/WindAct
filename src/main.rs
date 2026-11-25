@@ -3,7 +3,7 @@
 use std::str::FromStr;
 use clap::{Parser, Subcommand};
 
-use windact::core::{BoundingBox, MouseButton, Point, ScrollAxis, WindActError};
+use windact::core::{BoundingBox, MouseButton, Point, ScrollAxis, TypingConfig, WindActError};
 use windact::engine::ActionEngine;
 use windact::injector::default_injector;
 use windact::planner::{BezierSplinePlanner, TrajectoryPlanner, WindMousePlanner};
@@ -128,6 +128,36 @@ enum Commands {
         steps: u32,
 
         /// Simulate timing without injecting OS wheel events.
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+    },
+
+    /// Type text with humanized key cadence and Unicode support.
+    SendText {
+        /// Text string to type.
+        #[arg(long)]
+        text: String,
+
+        /// Typing rhythm profile (casual, fast, slow).
+        #[arg(long, default_value = "casual")]
+        profile: String,
+
+        /// Simulate timing calculation without injecting OS keyboard events.
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+    },
+
+    /// Press a single key or modifier combo (e.g., "enter", "ctrl+a", "ctrl+shift+s").
+    KeyPress {
+        /// Key or combination string.
+        #[arg(long)]
+        key: String,
+
+        /// Optional fixed hold duration in milliseconds.
+        #[arg(long)]
+        hold_ms: Option<u32>,
+
+        /// Simulate timing calculation without injecting OS keyboard events.
         #[arg(long, default_value_t = false)]
         dry_run: bool,
     },
@@ -269,6 +299,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             steps,
             dry_run,
         } => engine.execute_scroll(delta, axis, steps, dry_run, None)?,
+
+        Commands::SendText {
+            text,
+            profile,
+            dry_run,
+        } => {
+            let cfg = TypingConfig::from_name(&profile)?;
+            engine.execute_send_text(&text, &cfg, dry_run, None)?
+        }
+
+        Commands::KeyPress {
+            key,
+            hold_ms,
+            dry_run,
+        } => engine.execute_key_press(&key, hold_ms, dry_run, None)?,
     };
 
     println!("{}", serde_json::to_string_pretty(&result)?);

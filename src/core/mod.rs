@@ -79,6 +79,154 @@ pub enum ScrollAxis {
     Horizontal,
 }
 
+/// Keyboard keys supported by `key_press` and modifier combinations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum KeyCode {
+    Enter,
+    Tab,
+    Space,
+    Backspace,
+    Escape,
+    Delete,
+    Home,
+    End,
+    PageUp,
+    PageDown,
+    Left,
+    Right,
+    Up,
+    Down,
+    Ctrl,
+    Alt,
+    Shift,
+    Win,
+    F(u8),
+    Char(char),
+}
+
+impl KeyCode {
+    /// Parses a single key name (case-insensitive), e.g. "enter", "ctrl", "f5", "a".
+    pub fn parse_single(name: &str) -> Result<Self> {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            return Err(WindActError::InvalidInput("Key name cannot be empty".into()));
+        }
+        let lower = trimmed.to_lowercase();
+        match lower.as_str() {
+            "enter" | "return" => Ok(Self::Enter),
+            "tab" => Ok(Self::Tab),
+            "space" => Ok(Self::Space),
+            "backspace" | "bs" => Ok(Self::Backspace),
+            "esc" | "escape" => Ok(Self::Escape),
+            "del" | "delete" => Ok(Self::Delete),
+            "home" => Ok(Self::Home),
+            "end" => Ok(Self::End),
+            "pageup" | "pgup" => Ok(Self::PageUp),
+            "pagedown" | "pgdn" => Ok(Self::PageDown),
+            "left" => Ok(Self::Left),
+            "right" => Ok(Self::Right),
+            "up" => Ok(Self::Up),
+            "down" => Ok(Self::Down),
+            "ctrl" | "control" => Ok(Self::Ctrl),
+            "alt" | "menu" => Ok(Self::Alt),
+            "shift" => Ok(Self::Shift),
+            "win" | "meta" | "super" => Ok(Self::Win),
+            _ if lower.starts_with('f') && lower.len() <= 3 => {
+                if let Ok(num) = lower[1..].parse::<u8>()
+                    && (1..=12).contains(&num)
+                {
+                    return Ok(Self::F(num));
+                }
+                Err(WindActError::InvalidInput(format!("Unsupported function key '{trimmed}'")))
+            }
+            _ => {
+                let mut chars = trimmed.chars();
+                if let (Some(ch), None) = (chars.next(), chars.next()) {
+                    Ok(Self::Char(ch))
+                } else {
+                    Err(WindActError::InvalidInput(format!("Unsupported key '{trimmed}'")))
+                }
+            }
+        }
+    }
+
+    /// Parses a key combination like "ctrl+shift+s" or "enter" into an ordered slice of keys.
+    pub fn parse_combo(combo: &str) -> Result<Vec<Self>> {
+        let parts: Vec<&str> = combo.split('+').collect();
+        if parts.is_empty() {
+            return Err(WindActError::InvalidInput("Key combo cannot be empty".into()));
+        }
+        parts.into_iter().map(Self::parse_single).collect()
+    }
+}
+
+/// Humanized typing rhythm configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct TypingConfig {
+    pub inter_key_min_ms: u32,
+    pub inter_key_max_ms: u32,
+    pub hold_min_ms: u32,
+    pub hold_max_ms: u32,
+    pub pause_chance: f64,
+    pub pause_min_ms: u32,
+    pub pause_max_ms: u32,
+}
+
+impl Default for TypingConfig {
+    fn default() -> Self {
+        Self::casual()
+    }
+}
+
+impl TypingConfig {
+    pub fn casual() -> Self {
+        Self {
+            inter_key_min_ms: 45,
+            inter_key_max_ms: 135,
+            hold_min_ms: 35,
+            hold_max_ms: 95,
+            pause_chance: 0.05,
+            pause_min_ms: 120,
+            pause_max_ms: 300,
+        }
+    }
+
+    pub fn fast() -> Self {
+        Self {
+            inter_key_min_ms: 20,
+            inter_key_max_ms: 65,
+            hold_min_ms: 20,
+            hold_max_ms: 55,
+            pause_chance: 0.02,
+            pause_min_ms: 80,
+            pause_max_ms: 160,
+        }
+    }
+
+    pub fn slow() -> Self {
+        Self {
+            inter_key_min_ms: 85,
+            inter_key_max_ms: 200,
+            hold_min_ms: 50,
+            hold_max_ms: 120,
+            pause_chance: 0.08,
+            pause_min_ms: 160,
+            pause_max_ms: 380,
+        }
+    }
+
+    pub fn from_name(name: &str) -> Result<Self> {
+        match name.to_lowercase().as_str() {
+            "casual" => Ok(Self::casual()),
+            "fast" => Ok(Self::fast()),
+            "slow" => Ok(Self::slow()),
+            _ => Err(WindActError::InvalidInput(format!(
+                "Unknown typing profile '{name}'. Expected one of: casual, fast, slow"
+            ))),
+        }
+    }
+}
+
 /// Execution status result of a trajectory or action.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActionResult {

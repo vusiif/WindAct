@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::core::{MouseButton, Point, Result, ScrollAxis, TrajectoryPoint, WindActError};
+use crate::core::{KeyCode, MouseButton, Point, Result, ScrollAxis, TrajectoryPoint, WindActError};
 
 /// High-precision sleep combining thread sleep and CPU busy-spin loop.
 /// Yields the thread for the bulk of the wait, then spins to achieve sub-millisecond accuracy.
@@ -89,6 +89,20 @@ pub trait InputInjector: Send + Sync {
 
     /// Retrieves the current physical cursor location.
     fn current_cursor_pos(&self) -> Result<Point>;
+
+    /// Presses down a keyboard key.
+    fn key_down(&self, key: KeyCode) -> Result<()>;
+
+    /// Releases a keyboard key.
+    fn key_up(&self, key: KeyCode) -> Result<()>;
+
+    /// Types a single character via OS Unicode or key mapping with a humanized hold time.
+    fn type_char_cancellable(
+        &self,
+        ch: char,
+        hold_ms: u32,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<()>;
 }
 
 // ---------------------------------------------------------------------------
@@ -104,14 +118,19 @@ pub mod windows {
         DPI_AWARENESS_CONTEXT, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE, SetThreadDpiAwarenessContext,
     };
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-        SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEINPUT,
-        MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
-        MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE,
+        GetKeyboardLayout, MapVirtualKeyExW, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD,
+        INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE,
+        MAPVK_VK_TO_VSC_EX, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN,
+        MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE,
         MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL,
+        MOUSEINPUT, VK_BACK, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_F1, VK_HOME,
+        VK_LEFT, VK_LWIN, VK_MENU, VK_NEXT, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_SPACE,
+        VK_TAB, VK_UP,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        GetCursorPos, GetSystemMetrics, SM_CXSCREEN, SM_CXVIRTUALSCREEN,
-        SM_CYSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, WHEEL_DELTA,
+        GetCursorPos, GetForegroundWindow, GetSystemMetrics, GetWindowThreadProcessId,
+        SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+        SM_YVIRTUALSCREEN, WHEEL_DELTA,
     };
 
     #[link(name = "winmm")]
@@ -239,6 +258,75 @@ pub mod windows {
                 )))
             }
         }
+
+        fn send_key_input(flags: u32, vk: u16, scan: u16) -> Result<()> {
+            let input = INPUT {
+                r#type: INPUT_KEYBOARD,
+                Anonymous: INPUT_0 {
+                    ki: KEYBDINPUT {
+                        wVk: vk,
+                        wScan: scan,
+                        dwFlags: flags,
+                        time: 0,
+                        dwExtraInfo: 0,
+                    },
+                },
+            };
+
+            let sent = unsafe { SendInput(1, &input, size_of::<INPUT>() as i32) };
+            if sent == 1 {
+                Ok(())
+            } else {
+                let err = std::io::Error::last_os_error();
+                Err(WindActError::InjectionError(format!(
+                    "SendInput keyboard failed: {err}"
+                )))
+            }
+        }
+
+        fn keycode_to_vk(key: KeyCode) -> Result<(u16, bool)> {
+            let pair = match key {
+                KeyCode::Enter => (VK_RETURN, false),
+                KeyCode::Tab => (VK_TAB, false),
+                KeyCode::Space => (VK_SPACE, false),
+                KeyCode::Backspace => (VK_BACK, false),
+                KeyCode::Escape => (VK_ESCAPE, false),
+                KeyCode::Delete => (VK_DELETE, true),
+                KeyCode::Home => (VK_HOME, true),
+                KeyCode::End => (VK_END, true),
+                KeyCode::PageUp => (VK_PRIOR, true),
+                KeyCode::PageDown => (VK_NEXT, true),
+                KeyCode::Left => (VK_LEFT, true),
+                KeyCode::Right => (VK_RIGHT, true),
+                KeyCode::Up => (VK_UP, true),
+                KeyCode::Down => (VK_DOWN, true),
+                KeyCode::Ctrl => (VK_CONTROL, false),
+                KeyCode::Alt => (VK_MENU, false),
+                KeyCode::Shift => (VK_SHIFT, false),
+                KeyCode::Win => (VK_LWIN, true),
+                KeyCode::F(n) if (1..=12).contains(&n) => (VK_F1 + (n as u16 - 1), false),
+                KeyCode::Char(c) if c.is_ascii_alphanumeric() => {
+                    (c.to_ascii_uppercase() as u16, false)
+                }
+                _ => {
+                    return Err(WindActError::InvalidInput(format!(
+                        "Key {key:?} cannot be mapped to a Win32 virtual key"
+                    )));
+                }
+            };
+            Ok(pair)
+        }
+
+        fn send_vk(&self, key: KeyCode, is_up: bool) -> Result<()> {
+            let (vk, is_ext) = Self::keycode_to_vk(key)?;
+            let layout = unsafe { GetKeyboardLayout(GetWindowThreadProcessId(GetForegroundWindow(), std::ptr::null_mut())) };
+            let scan = unsafe { MapVirtualKeyExW(vk as u32, MAPVK_VK_TO_VSC_EX, layout) } as u16;
+            let mut flags = if is_ext { KEYEVENTF_EXTENDEDKEY } else { 0 };
+            if is_up {
+                flags |= KEYEVENTF_KEYUP;
+            }
+            Self::send_key_input(flags, vk, scan)
+        }
     }
 
     impl InputInjector for WindowsInjector {
@@ -339,6 +427,58 @@ pub mod windows {
                 Err(WindActError::InjectionError(format!("GetCursorPos failed: {err}")))
             }
         }
+
+        fn key_down(&self, key: KeyCode) -> Result<()> {
+            self.send_vk(key, false)
+        }
+
+        fn key_up(&self, key: KeyCode) -> Result<()> {
+            self.send_vk(key, true)
+        }
+
+        fn type_char_cancellable(
+            &self,
+            ch: char,
+            hold_ms: u32,
+            cancel: Option<&AtomicBool>,
+        ) -> Result<()> {
+            match ch {
+                '\n' => {
+                    self.key_down(KeyCode::Enter)?;
+                    let ok = hybrid_sleep_cancellable(Duration::from_millis(hold_ms as u64), cancel);
+                    self.key_up(KeyCode::Enter)?;
+                    return if ok { Ok(()) } else { Err(WindActError::Aborted) };
+                }
+                '\r' => return Ok(()),
+                '\t' => {
+                    self.key_down(KeyCode::Tab)?;
+                    let ok = hybrid_sleep_cancellable(Duration::from_millis(hold_ms as u64), cancel);
+                    self.key_up(KeyCode::Tab)?;
+                    return if ok { Ok(()) } else { Err(WindActError::Aborted) };
+                }
+                '\0' => {
+                    return Err(WindActError::InvalidInput(
+                        "Text cannot contain null bytes".into(),
+                    ));
+                }
+                _ => {}
+            }
+
+            let mut buf = [0u16; 2];
+            let units = ch.encode_utf16(&mut buf);
+            for &code_unit in units.iter() {
+                Self::send_key_input(KEYEVENTF_UNICODE, 0, code_unit)?;
+            }
+            let ok = if hold_ms > 0 {
+                hybrid_sleep_cancellable(Duration::from_millis(hold_ms as u64), cancel)
+            } else {
+                true
+            };
+            for &code_unit in units.iter().rev() {
+                Self::send_key_input(KEYEVENTF_UNICODE | KEYEVENTF_KEYUP, 0, code_unit)?;
+            }
+            if ok { Ok(()) } else { Err(WindActError::Aborted) }
+        }
     }
 }
 
@@ -424,6 +564,28 @@ pub mod mock {
                 self.last_x.load(Ordering::Relaxed) as f64,
                 self.last_y.load(Ordering::Relaxed) as f64,
             ))
+        }
+
+        fn key_down(&self, _key: KeyCode) -> Result<()> {
+            Ok(())
+        }
+
+        fn key_up(&self, _key: KeyCode) -> Result<()> {
+            Ok(())
+        }
+
+        fn type_char_cancellable(
+            &self,
+            _ch: char,
+            hold_ms: u32,
+            cancel: Option<&AtomicBool>,
+        ) -> Result<()> {
+            let ok = if hold_ms > 0 {
+                hybrid_sleep_cancellable(Duration::from_millis(hold_ms as u64), cancel)
+            } else {
+                true
+            };
+            if ok { Ok(()) } else { Err(WindActError::Aborted) }
         }
     }
 }

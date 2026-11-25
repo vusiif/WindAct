@@ -1,18 +1,21 @@
 //! Integration tests for WindAct trajectory generation, engine, and stdio protocol.
 
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use windact::core::{BoundingBox, MouseButton, Point, Result, ScrollAxis, TrajectoryPoint, WindActError};
+use windact::core::{
+    BoundingBox, KeyCode, MouseButton, Point, Result, ScrollAxis, TrajectoryPoint, TypingConfig,
+    WindActError,
+};
 use windact::engine::ActionEngine;
 use windact::injector::{hybrid_sleep_cancellable, InputInjector};
 use windact::planner::{TrajectoryPlanner, WindMousePlanner};
 use windact::profile::Profile;
 use windact::stdio::{dispatch_command, StdioCommand};
 
-/// In-memory test injector that records button state, moves, and scroll deltas without touching OS input.
+/// In-memory test injector that records button state, moves, scroll deltas, and keyboard events.
 #[derive(Default)]
 struct TestInjector {
     press_count: AtomicU32,
@@ -20,6 +23,8 @@ struct TestInjector {
     scroll_sum: AtomicI32,
     last_x: AtomicI32,
     last_y: AtomicI32,
+    key_events: Mutex<Vec<(KeyCode, bool)>>, // (key, is_down)
+    typed_chars: Mutex<String>,
 }
 
 impl InputInjector for TestInjector {
@@ -80,6 +85,30 @@ impl InputInjector for TestInjector {
             self.last_x.load(Ordering::Relaxed) as f64,
             self.last_y.load(Ordering::Relaxed) as f64,
         ))
+    }
+
+    fn key_down(&self, key: KeyCode) -> Result<()> {
+        self.key_events.lock().unwrap().push((key, true));
+        Ok(())
+    }
+
+    fn key_up(&self, key: KeyCode) -> Result<()> {
+        self.key_events.lock().unwrap().push((key, false));
+        Ok(())
+    }
+
+    fn type_char_cancellable(
+        &self,
+        ch: char,
+        hold_ms: u32,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<()> {
+        let ok = hybrid_sleep_cancellable(Duration::from_millis(hold_ms as u64), cancel);
+        if !ok {
+            return Err(WindActError::Aborted);
+        }
+        self.typed_chars.lock().unwrap().push(ch);
+        Ok(())
     }
 }
 
@@ -376,4 +405,58 @@ fn test_draw_strokes_stdio_and_abort_safety() {
     let pressed = engine.injector().press_count.load(Ordering::SeqCst);
     let released = engine.injector().release_count.load(Ordering::SeqCst);
     assert_eq!(pressed, released, "Left button must be released after draw_strokes abort");
+}
+
+#[test]
+fn test_keyboard_send_text_and_combo_lifo_release() {
+    let engine = Arc::new(ActionEngine::new(WindMousePlanner::new(), TestInjector::default()));
+
+    // 1. Test stdio send_text with Unicode
+    let text_json = r#"{"id": 20, "op": "send_text", "text": "Hi 你好", "profile": "fast"}"#;
+    let cmd: StdioCommand = serde_json::from_str(text_json).unwrap();
+    let res = dispatch_command(&engine, cmd, None);
+    assert_eq!(res.id, Some(20));
+    assert_eq!(res.status, "ok");
+    assert_eq!(res.total_points, Some(5));
+    assert_eq!(*engine.injector().typed_chars.lock().unwrap(), "Hi 你好");
+
+    // 2. Test key_press combo LIFO release order: ctrl+shift+s -> down(Ctrl, Shift, 's') -> up('s', Shift, Ctrl)
+    let key_json = r#"{"id": 21, "op": "key_press", "key": "ctrl+shift+s", "hold_ms": 10}"#;
+    let cmd_key: StdioCommand = serde_json::from_str(key_json).unwrap();
+    let res_key = dispatch_command(&engine, cmd_key, None);
+    assert_eq!(res_key.status, "ok");
+
+    let events = engine.injector().key_events.lock().unwrap().clone();
+    assert_eq!(
+        events,
+        vec![
+            (KeyCode::Ctrl, true),
+            (KeyCode::Shift, true),
+            (KeyCode::Char('s'), true),
+            (KeyCode::Char('s'), false),
+            (KeyCode::Shift, false),
+            (KeyCode::Ctrl, false),
+        ]
+    );
+
+    // 3. Test mid-combo abort still releases all held modifiers
+    engine.injector().key_events.lock().unwrap().clear();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let e_worker = Arc::clone(&engine);
+    let c_worker = Arc::clone(&cancel);
+    let handle = thread::spawn(move || {
+        e_worker.execute_key_press("ctrl+a", Some(200), false, Some(&c_worker))
+    });
+    thread::sleep(Duration::from_millis(60));
+    cancel.store(true, Ordering::SeqCst);
+    let abort_res = handle.join().unwrap();
+    assert!(matches!(abort_res, Err(WindActError::Aborted)));
+
+    let post_abort = engine.injector().key_events.lock().unwrap();
+    let downs = post_abort.iter().filter(|e| e.1).count();
+    let ups = post_abort.iter().filter(|e| !e.1).count();
+    assert_eq!(downs, ups, "All pressed modifier keys must be released on abort");
+
+    // 4. Test typing profile validation
+    assert!(TypingConfig::from_name("invalid").is_err());
 }
