@@ -8,6 +8,7 @@ use crate::core::{
     ActionResult, KeyCode, MouseButton, Point, Result, ScrollAxis, TrajectoryPoint, TypingConfig,
     WindActError,
 };
+use crate::font::{layout_text_strokes, AsciiFontStyle};
 use crate::injector::{hybrid_sleep_cancellable, InputInjector};
 use crate::planner::{StrokeConfig, StrokePlanner, TrajectoryPlanner};
 use crate::profile::Profile;
@@ -257,6 +258,7 @@ impl<P: TrajectoryPlanner, I: InputInjector> ActionEngine<P, I> {
         let stroke_planner = StrokePlanner::new();
         let mut rng = rand::thread_rng();
         let mut total_ms = 0u64;
+        let mut total_point_count = 0usize;
         let mut all_points = Vec::new();
 
         let mut cursor_pos = if !dry_run {
@@ -275,11 +277,18 @@ impl<P: TrajectoryPlanner, I: InputInjector> ActionEngine<P, I> {
                 .copied()
                 .ok_or_else(|| WindActError::InvalidInput("Stroke cannot be empty".into()))?;
 
-            // 1. Airborne transition between strokes using WindMouse
-            if !dry_run && (idx > 0 || cursor_pos.distance_to(&stroke_start) > 3.0) {
-                let airborne = self.planner.generate(cursor_pos, stroke_start, &Profile::fast())?;
-                total_ms += airborne.last().map(|p| p.elapsed_ms).unwrap_or(0);
-                self.injector.play_trajectory_cancellable(&airborne, cancel)?;
+            // 1. Airborne transition between strokes
+            let hop_dist = cursor_pos.distance_to(&stroke_start);
+            if !dry_run && (idx > 0 || hop_dist > 3.0) {
+                if hop_dist <= cfg.fast_airborne_threshold_px && hop_dist > 3.0 {
+                    let hop = Self::build_fast_hop(cursor_pos, stroke_start);
+                    total_ms += hop.last().map(|p| p.elapsed_ms).unwrap_or(0);
+                    self.injector.play_trajectory_cancellable(&hop, cancel)?;
+                } else {
+                    let airborne = self.planner.generate(cursor_pos, stroke_start, &Profile::fast())?;
+                    total_ms += airborne.last().map(|p| p.elapsed_ms).unwrap_or(0);
+                    self.injector.play_trajectory_cancellable(&airborne, cancel)?;
+                }
             } else if !dry_run {
                 let (sx, sy) = stroke_start.to_i32();
                 self.injector.move_cursor(sx, sy)?;
@@ -288,19 +297,36 @@ impl<P: TrajectoryPlanner, I: InputInjector> ActionEngine<P, I> {
             // 2. Plan stroke geometry + kinematics
             let stroke_pts = stroke_planner.generate_stroke(waypoints, cfg)?;
             let stroke_ms = stroke_pts.last().map(|p| p.elapsed_ms).unwrap_or(0);
+            let pre_press_settle_ms = cfg.pre_press_settle_ms as u64;
             let dwell_ms = rng.gen_range(cfg.landing_dwell_min_ms..=cfg.landing_dwell_max_ms);
-            total_ms += dwell_ms as u64 + stroke_ms;
+            let lift_dwell_ms = rng.gen_range(cfg.lift_dwell_min_ms..=cfg.lift_dwell_max_ms) as u64;
+            total_ms += pre_press_settle_ms + dwell_ms as u64 + stroke_ms + lift_dwell_ms;
+            total_point_count += stroke_pts.len();
 
             if dry_run {
                 all_points.extend(stroke_pts);
             } else {
-                // 3. Pen down + landing dwell + stroke playback + guaranteed pen up
+                // Allow target window to process cursor arrival before pressing Left button
+                if pre_press_settle_ms > 0
+                    && !hybrid_sleep_cancellable(Duration::from_millis(pre_press_settle_ms), cancel)
+                {
+                    return Err(WindActError::Aborted);
+                }
+
+                // 3. Pen down + landing dwell + stroke playback + lift dwell + guaranteed pen up
                 self.injector.press_button(MouseButton::Left)?;
                 let play_res = (|| -> Result<()> {
-                    if !hybrid_sleep_cancellable(Duration::from_millis(dwell_ms as u64), cancel) {
+                    if dwell_ms > 0
+                        && !hybrid_sleep_cancellable(Duration::from_millis(dwell_ms as u64), cancel)
+                    {
                         return Err(WindActError::Aborted);
                     }
                     self.injector.play_trajectory_cancellable(&stroke_pts, cancel)?;
+                    if lift_dwell_ms > 0
+                        && !hybrid_sleep_cancellable(Duration::from_millis(lift_dwell_ms), cancel)
+                    {
+                        return Err(WindActError::Aborted);
+                    }
                     Ok(())
                 })();
                 let release_res = self.injector.release_button(MouseButton::Left);
@@ -316,11 +342,29 @@ impl<P: TrajectoryPlanner, I: InputInjector> ActionEngine<P, I> {
         Ok(ActionResult {
             id: None,
             status: "ok".to_string(),
-            total_points: Some(all_points.len()),
+            total_points: Some(total_point_count),
             duration_ms: total_ms,
             points: if dry_run { Some(all_points) } else { None },
             error: None,
         })
+    }
+
+    /// Lays out text using single-line vector fonts (Hershey ASCII + optional Make Me a Hanzi)
+    /// with per-glyph affine jitter, then draws it via `execute_draw_strokes`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_draw_text(
+        &self,
+        text: &str,
+        origin: Point,
+        font_size_px: f64,
+        style: AsciiFontStyle,
+        hanzi_font_path: Option<&std::path::Path>,
+        stroke_cfg: &StrokeConfig,
+        dry_run: bool,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<ActionResult> {
+        let strokes = layout_text_strokes(text, origin, font_size_px, style, hanzi_font_path)?;
+        self.execute_draw_strokes(&strokes, stroke_cfg, dry_run, cancel)
     }
 
     /// Types text with realistic human rhythm:
@@ -517,6 +561,23 @@ impl<P: TrajectoryPlanner, I: InputInjector> ActionEngine<P, I> {
             points: None,
             error: None,
         })
+    }
+
+    /// Lightweight 4-point arc hop for short inter-stroke pen-up transitions.
+    fn build_fast_hop(from: Point, to: Point) -> Vec<TrajectoryPoint> {
+        let steps = 4usize;
+        let mut pts = Vec::with_capacity(steps);
+        let mut elapsed = 0u64;
+        for i in 1..=steps {
+            let t = i as f64 / steps as f64;
+            let eased = t * t * (3.0 - 2.0 * t);
+            let x = (from.x + (to.x - from.x) * eased).round() as i32;
+            let y = (from.y + (to.y - from.y) * eased).round() as i32;
+            let delay = 3u32;
+            elapsed += delay as u64;
+            pts.push(TrajectoryPoint::new(x, y, delay, elapsed));
+        }
+        pts
     }
 
     fn build_ok_result(

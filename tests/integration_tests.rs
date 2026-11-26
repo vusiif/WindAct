@@ -382,7 +382,46 @@ fn test_draw_strokes_stdio_and_abort_safety() {
     let res = dispatch_command(&engine, cmd, None);
     assert_eq!(res.id, Some(10));
     assert_eq!(res.status, "ok");
-    assert!(res.points.is_some());
+    let dry_pts = res.points.expect("dry_run should return points");
+    assert!(!dry_pts.is_empty());
+    assert_eq!(res.total_points, Some(dry_pts.len()));
+
+    // Verify stdio JSONL draw_strokes live (dry_run: false) reports non-zero total_points
+    // and normalizes px/s base_speed (e.g. 1600 -> 1.6 px/ms) without rushing at 1ms/point.
+    let live_json = r#"{"id": 11, "op": "draw_strokes", "strokes": [[[100,100],[260,100]]], "dry_run": false, "base_speed": 1600, "curvature_alpha": 0.15, "drift_amplitude": 0.3}"#;
+    let live_cmd: StdioCommand = serde_json::from_str(live_json).unwrap();
+    let live_res = dispatch_command(&engine, live_cmd, None);
+    assert_eq!(live_res.id, Some(11));
+    assert_eq!(live_res.status, "ok");
+    assert!(live_res.points.is_none());
+    assert!(
+        live_res.total_points.unwrap_or(0) > 50,
+        "Live draw_strokes must report actual point count, got {:?}",
+        live_res.total_points
+    );
+    assert!(
+        live_res.duration_ms >= 100,
+        "Normalized base_speed 1600 -> 1.6 px/ms should take ~100ms+ for 160px stroke, got {}ms",
+        live_res.duration_ms
+    );
+    assert_eq!(
+        engine.injector().press_count.load(Ordering::SeqCst),
+        engine.injector().release_count.load(Ordering::SeqCst),
+        "Left button must be balanced after live draw_strokes"
+    );
+
+    // Verify handwriting mode uses low dwell & fast short hops
+    let hw_json = r#"{"id": 12, "op": "draw_strokes", "mode": "handwriting", "strokes": [[[100,100],[140,100]],[[110,120],[150,120]],[[120,100],[120,140]]], "dry_run": false}"#;
+    let hw_cmd: StdioCommand = serde_json::from_str(hw_json).unwrap();
+    let hw_res = dispatch_command(&engine, hw_cmd, None);
+    assert_eq!(hw_res.id, Some(12));
+    assert_eq!(hw_res.status, "ok");
+    assert!(hw_res.total_points.unwrap_or(0) > 10);
+    assert!(
+        hw_res.duration_ms < 200,
+        "Handwriting mode 3 short strokes should complete quickly (<200ms), got {}ms",
+        hw_res.duration_ms
+    );
 
     // Verify mid-stroke abort safely releases button
     let cancel = Arc::new(AtomicBool::new(false));
@@ -459,4 +498,39 @@ fn test_keyboard_send_text_and_combo_lifo_release() {
 
     // 4. Test typing profile validation
     assert!(TypingConfig::from_name("invalid").is_err());
+}
+
+#[test]
+fn test_draw_text_hershey_and_hanzi_graphics_stream() {
+    let engine = ActionEngine::new(WindMousePlanner::new(), TestInjector::default());
+
+    // 1. Built-in Hershey ASCII draw_text via stdio
+    let json = r#"{"id": 30, "op": "draw_text", "text": "WindAct 2026!", "x": 300, "y": 350, "size": 55, "style": "scripts", "dry_run": true}"#;
+    let cmd: StdioCommand = serde_json::from_str(json).unwrap();
+    let res = dispatch_command(&engine, cmd, None);
+    assert_eq!(res.id, Some(30));
+    assert_eq!(res.status, "ok");
+    assert!(res.total_points.unwrap_or(0) > 50);
+
+    // 2. Temporary Make Me a Hanzi graphics.txt file for mixed CJK + ASCII layout
+    let temp_path = std::env::temp_dir().join("windact_test_hanzi_graphics.txt");
+    let sample_hanzi = r#"{"character":"一","medians":[[[100,500],[900,500]]]}"#;
+    std::fs::write(&temp_path, format!("{sample_hanzi}\n")).unwrap();
+
+    let hanzi_res = engine
+        .execute_draw_text(
+            "A一",
+            Point::new(200.0, 200.0),
+            60.0,
+            windact::font::AsciiFontStyle::Romans,
+            Some(&temp_path),
+            &windact::planner::StrokeConfig::default(),
+            true,
+            None,
+        )
+        .unwrap();
+    let _ = std::fs::remove_file(&temp_path);
+
+    assert_eq!(hanzi_res.status, "ok");
+    assert!(hanzi_res.total_points.unwrap_or(0) > 20);
 }

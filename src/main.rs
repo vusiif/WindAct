@@ -6,8 +6,9 @@ use clap::{Parser, Subcommand};
 use windact::bench::run_benchmarks;
 use windact::core::{BoundingBox, MouseButton, Point, ScrollAxis, TypingConfig, WindActError};
 use windact::engine::ActionEngine;
+use windact::font::AsciiFontStyle;
 use windact::injector::default_injector;
-use windact::planner::{BezierSplinePlanner, TrajectoryPlanner, WindMousePlanner};
+use windact::planner::{BezierSplinePlanner, StrokeConfig, TrajectoryPlanner, WindMousePlanner};
 use windact::profile::Profile;
 use windact::stdio::run_stdio_loop;
 
@@ -173,6 +174,37 @@ enum Commands {
         #[arg(long, default_value_t = 500)]
         iterations: usize,
     },
+
+    /// Handwrite text on screen using built-in Hershey single-line fonts (and optional Make Me a Hanzi).
+    DrawText {
+        /// Text string to handwrite.
+        #[arg(long)]
+        text: String,
+
+        /// Top-left starting X coordinate.
+        #[arg(long)]
+        x: f64,
+
+        /// Top-left starting Y coordinate.
+        #[arg(long)]
+        y: f64,
+
+        /// Font height in pixels.
+        #[arg(long, default_value_t = 60.0)]
+        size: f64,
+
+        /// Built-in ASCII single-line font style (romans, scripts).
+        #[arg(long, default_value = "romans")]
+        style: AsciiFontStyle,
+
+        /// Optional path to Make Me a Hanzi `graphics.txt` for Chinese characters.
+        #[arg(long)]
+        hanzi_font: Option<String>,
+
+        /// Output calculated stroke trajectories without injecting OS mouse input.
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+    },
 }
 
 fn parse_point(s: &str) -> Result<Point, WindActError> {
@@ -334,6 +366,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let report = run_benchmarks(samples, iterations);
             println!("{}", serde_json::to_string_pretty(&report)?);
             return Ok(());
+        }
+
+        Commands::DrawText {
+            text,
+            x,
+            y,
+            size,
+            style,
+            hanzi_font,
+            dry_run,
+        } => {
+            let path_buf = hanzi_font.map(std::path::PathBuf::from);
+            engine.execute_draw_text(
+                &text,
+                Point::new(x, y),
+                size,
+                style,
+                path_buf.as_deref(),
+                &StrokeConfig::default(),
+                dry_run,
+                None,
+            )?
         }
     };
 

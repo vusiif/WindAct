@@ -12,6 +12,7 @@ use crate::core::{
     ActionResult, BoundingBox, MouseButton, Point, Result, ScrollAxis, TypingConfig, WindActError,
 };
 use crate::engine::ActionEngine;
+use crate::font::AsciiFontStyle;
 use crate::injector::InputInjector;
 use crate::planner::{BezierSplinePlanner, StrokeConfig, TrajectoryPlanner, WindMousePlanner};
 use crate::profile::Profile;
@@ -26,6 +27,10 @@ fn default_slider() -> String {
 
 fn default_scroll_steps() -> u32 {
     3
+}
+
+fn default_font_size() -> f64 {
+    60.0
 }
 
 /// Incoming JSONL command envelope.
@@ -88,11 +93,28 @@ pub enum StdioOp {
     DrawStrokes {
         strokes: Vec<Vec<[f64; 2]>>,
         #[serde(default)]
+        mode: Option<String>,
+        #[serde(default)]
         base_speed: Option<f64>,
         #[serde(default)]
         curvature_alpha: Option<f64>,
         #[serde(default)]
         drift_amplitude: Option<f64>,
+        #[serde(default)]
+        dry_run: bool,
+    },
+    DrawText {
+        text: String,
+        x: f64,
+        y: f64,
+        #[serde(default = "default_font_size")]
+        size: f64,
+        #[serde(default)]
+        style: AsciiFontStyle,
+        #[serde(default)]
+        hanzi_font: Option<String>,
+        #[serde(default)]
+        base_speed: Option<f64>,
         #[serde(default)]
         dry_run: bool,
     },
@@ -216,14 +238,20 @@ pub fn dispatch_command<P: TrajectoryPlanner, I: InputInjector>(
 
         StdioOp::DrawStrokes {
             strokes,
+            mode,
             base_speed,
             curvature_alpha,
             drift_amplitude,
             dry_run,
         } => {
-            let mut cfg = StrokeConfig::default();
+            let mut cfg = match mode.as_deref().map(|s| s.to_lowercase()).as_deref() {
+                Some("handwriting") | Some("fast") => StrokeConfig::handwriting(),
+                _ => StrokeConfig::default(),
+            };
             if let Some(v) = base_speed {
-                cfg.base_speed_px_per_ms = v;
+                // Normalize px/s values (e.g. 1600) to px/ms if caller passed pixels-per-second
+                let speed_px_per_ms = if v > 50.0 { v / 1000.0 } else { v };
+                cfg.base_speed_px_per_ms = speed_px_per_ms.clamp(0.2, 10.0);
             }
             if let Some(a) = curvature_alpha {
                 cfg.curvature_alpha = a;
@@ -236,6 +264,33 @@ pub fn dispatch_command<P: TrajectoryPlanner, I: InputInjector>(
                 .map(|s| s.into_iter().map(|p| Point::new(p[0], p[1])).collect())
                 .collect();
             engine.execute_draw_strokes(&pts, &cfg, dry_run, cancel)
+        }
+
+        StdioOp::DrawText {
+            text,
+            x,
+            y,
+            size,
+            style,
+            hanzi_font,
+            base_speed,
+            dry_run,
+        } => {
+            let mut cfg = StrokeConfig::default();
+            if let Some(v) = base_speed {
+                cfg.base_speed_px_per_ms = v;
+            }
+            let path_buf = hanzi_font.map(std::path::PathBuf::from);
+            engine.execute_draw_text(
+                &text,
+                Point::new(x, y),
+                size,
+                style,
+                path_buf.as_deref(),
+                &cfg,
+                dry_run,
+                cancel,
+            )
         }
 
         StdioOp::SendText {
